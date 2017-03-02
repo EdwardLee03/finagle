@@ -5,6 +5,7 @@ import com.twitter.finagle.stats.{NullStatsReceiver, InMemoryStatsReceiver}
 import com.twitter.finagle.{Status, ServiceFactory, Service, ServiceFactoryWrapper, Stack}
 import com.twitter.finagle.param
 import com.twitter.finagle.service.exp.FailureAccrualPolicy
+import com.twitter.finagle.toggle.flag
 import com.twitter.util._
 import java.util.concurrent.TimeUnit
 import org.junit.runner.RunWith
@@ -27,7 +28,7 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
   def consecutiveFailures = FailureAccrualPolicy.consecutiveFailures(3, markDeadFor)
 
   class Helper(failureAccrualPolicy: FailureAccrualPolicy) {
-    val statsReceiver = new InMemoryStatsReceiver()
+    val statsReceiver = new InMemoryStatsReceiver
     val underlyingService = mock[Service[Int, Int]]
     when(underlyingService.close(any[Time])) thenReturn Future.Done
     when(underlyingService.status) thenReturn Status.Open
@@ -41,9 +42,21 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     val timer = new MockTimer
 
     val factory = new FailureAccrualFactory[Int, Int](
-      underlying, failureAccrualPolicy, timer, statsReceiver, "test")
-    val service = Await.result(factory())
+      underlying, failureAccrualPolicy, ResponseClassifier.Default, timer, statsReceiver)
+    val service = Await.result(factory(), 5.seconds)
     verify(underlying)()
+  }
+
+  test("default policy is consecutiveFailures") {
+    assert(FailureAccrualFactory.defaultPolicy.toString.contains(
+      "FailureAccrualPolicy.consecutiveFailures"))
+  }
+
+  test("default policy can be toggled to successRate with window") {
+    flag.overrides.let("com.twitter.finagle.core.UseSuccessRateFailureAccrual", 1.0) {
+      assert(FailureAccrualFactory.defaultPolicy.toString.contains(
+        "FailureAccrualPolicy.successRateWithinDuration"))
+    }
   }
 
   test("a failing service should become unavailable") {
@@ -51,19 +64,15 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     import h._
 
     Time.withCurrentTimeFrozen { timeControl =>
-      intercept[Exception] {
-        Await.result(service(123))
+      for (i <- 0 until 3) {
+        assert(factory.isAvailable)
+        assert(service.isAvailable)
+        intercept[Exception] {
+          Await.result(service(123), 5.seconds)
+        }
       }
-      intercept[Exception] {
-        Await.result(service(123))
-      }
-      assert(factory.isAvailable)
-      assert(service.isAvailable)
+      // Now failed
 
-      // Now fail:
-      intercept[Exception] {
-        Await.result(service(123))
-      }
       assert(statsReceiver.counters.get(List("removals")) == Some(1))
       assert(!factory.isAvailable)
       assert(!service.isAvailable)
@@ -84,12 +93,12 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     }
     val stats = new InMemoryStatsReceiver()
     val faf = new FailureAccrualFactory[Int, Int](
-      svcFactory,
-      FailureAccrualPolicy.consecutiveFailures(1, Backoff.const(2.seconds)),
-      Timer.Nil,
-      stats,
+      underlying = svcFactory,
+      policy = FailureAccrualPolicy.consecutiveFailures(1, Backoff.const(2.seconds)),
+      timer = Timer.Nil,
+      statsReceiver = stats,
       responseClassifier = classifier)
-    val svc = Await.result(faf(), 5.second)
+    val svc = Await.result(faf(), 5.seconds)
 
     // normally these are failures, but these will not trip it...
     svc(-1)
@@ -106,14 +115,10 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     import h._
 
     Time.withCurrentTimeFrozen { timeControl =>
-      intercept[Exception] {
-        Await.result(service(123))
-      }
-      intercept[Exception] {
-        Await.result(service(123))
-      }
-      intercept[Exception] {
-        Await.result(service(123))
+      for (i <- 0 until 3) {
+        intercept[Exception] {
+          Await.result(service(123), 5.seconds)
+        }
       }
       assert(statsReceiver.counters.get(List("removals")) == Some(1))
       assert(!factory.isAvailable)
@@ -131,13 +136,12 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
 
       // But after one bad dispatch, mark it again unhealthy.
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
-
+      assert(statsReceiver.counters.get(List("probes")) == Some(1))
       assert(statsReceiver.counters.get(List("removals")) == Some(1))
       assert(!factory.isAvailable)
       assert(!service.isAvailable)
-
     }
   }
 
@@ -152,18 +156,17 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       // 3 failures must occur before the service is initially removed,
       // then one failure after each re-instating
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
+      }
+      // After another failure, the service should be unavailable
+      intercept[Exception] {
+        Await.result(service(123), 5.seconds)
       }
 
       for (i <- 0 until markDeadForList.length) {
-        // After another failure, the service should be unavailable
-        intercept[Exception] {
-          Await.result(service(123))
-        }
-
         assert(statsReceiver.counters.get(List("removals")) == Some(1))
         assert(!factory.isAvailable)
         assert(!service.isAvailable)
@@ -187,6 +190,13 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
         assert(statsReceiver.counters.get(List("revivals")) == None)
         assert(factory.isAvailable)
         assert(service.isAvailable)
+
+        // After another failure, the service should be unavailable
+        intercept[Exception] {
+          Await.result(service(123), 5.seconds)
+        }
+        val probeStat = statsReceiver.counters.get(List("probes"))
+        assert(probeStat.isDefined && probeStat.get >= 1)
       }
     }
   }
@@ -208,7 +218,11 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     val timer = new MockTimer
 
     val factory = new FailureAccrualFactory[Int, Int](
-      underlying, FailureAccrualPolicy.consecutiveFailures(3, markDeadFor), timer, statsReceiver, "test")
+      underlying = underlying,
+      policy = FailureAccrualPolicy.consecutiveFailures(3, markDeadFor),
+      responseClassifier = ResponseClassifier.Default,
+      timer = timer,
+      statsReceiver = statsReceiver)
     val service = Await.result(factory())
     verify(underlying)()
 
@@ -217,16 +231,16 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       // 3 failures must occur before the service is initially removed,
       // then one failure after each re-instating
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
 
       for (i <- 0 until markDeadFor.length) {
         // After another failure, the service should be unavailable
         intercept[Exception] {
-          Await.result(service(123))
+          Await.result(service(123), 5.seconds)
         }
 
         assert(statsReceiver.counters.get(List("removals")) == Some(1))
@@ -255,7 +269,7 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       }
 
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
 
       // The stream of backoffs has run out, so we should be using 300 seconds
@@ -289,14 +303,14 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       // then one failure after each probing
       for (i <- 0 until 2) {
         intercept[Exception] {
-          Await.result(service(123))
+          Await.result(service(123), 5.seconds)
         }
       }
 
       for (i <- 0 until markDeadForList.length) {
         // After another failure, the service should be unavailable
         intercept[Exception] {
-          Await.result(service(123))
+          Await.result(service(123), 5.seconds)
         }
 
         // Make sure the backoff follows the pattern above; after another
@@ -311,13 +325,13 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       }
 
       // Now succeed; markdead should be reset
-      Await.result(service(456))
+      Await.result(service(456), 5.seconds)
 
       // Fail again
       for (i <- 0 until 3) {
         when(underlyingService(123)) thenReturn Future.exception(new Exception)
         intercept[Exception] {
-          Await.result(service(123))
+          Await.result(service(123), 5.seconds)
         }
       }
 
@@ -339,14 +353,14 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
 
       assert(factory.status == Status.Open)
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       intercept[Exception] {
         Await.result(service(123))
       }
       assert(factory.status == Status.Open)
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
 
       assert(factory.status == Status.Busy)
@@ -366,7 +380,7 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     Time.withCurrentTimeFrozen { tc =>
       for (i <- 1 to 3) {
         intercept[Exception] {
-          Await.result(service(123))
+          Await.result(service(123), 5.seconds)
         }
       }
 
@@ -387,7 +401,7 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
         }
       }
 
-      Await.result(service(456))
+      Await.result(service(456), 5.seconds)
       assert(factory.status == Status.Open)
     }
   }
@@ -399,7 +413,7 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     Time.withCurrentTimeFrozen { tc =>
       for (i <- 1 to 3) {
         intercept[Exception] {
-          Await.result(service(123))
+          Await.result(service(123), 5.seconds)
         }
       }
 
@@ -422,7 +436,7 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       }
 
       intercept[Exception] {
-        Await.result(service(456))
+        Await.result(service(456), 5.seconds)
       }
 
       // Should be busy after probe fails
@@ -436,13 +450,13 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
 
     Time.withCurrentTimeFrozen { timeControl =>
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       assert(statsReceiver.counters.get(List("removals")) == Some(1))
       assert(!factory.isAvailable)
@@ -458,12 +472,12 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       assert(service.isAvailable)
 
       when(underlyingService(123)) thenReturn Future.value(321)
-      Await.result(service(123))
+      Await.result(service(123), 5.seconds)
 
       // A good dispatch; revived
       assert(statsReceiver.counters.get(List("revivals")) == Some(1))
       assert(statsReceiver.counters.get(List("removals")) == Some(1))
-      assert(Await.result(service(123)) == 321)
+      assert(Await.result(service(123), 5.seconds) == 321)
 
       assert(factory.isAvailable)
       assert(service.isAvailable)
@@ -471,24 +485,65 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
       // Counts are now reset.
       when(underlyingService(123)) thenReturn Future.exception(new Exception)
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       assert(statsReceiver.counters.get(List("revivals")) == Some(1))
       assert(statsReceiver.counters.get(List("removals")) == Some(1))
       assert(factory.isAvailable)
       assert(service.isAvailable)
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       assert(factory.isAvailable)
       assert(service.isAvailable)
       intercept[Exception] {
-        Await.result(service(123))
+        Await.result(service(123), 5.seconds)
       }
       assert(statsReceiver.counters.get(List("revivals")) == Some(1))
       assert(statsReceiver.counters.get(List("removals")) == Some(2))
       assert(!factory.isAvailable)
       assert(!service.isAvailable)
+    }
+  }
+
+  test("A failure during probing that does not mark dead moves back to probing") {
+    val policy = new FailureAccrualPolicy {
+      var markDead = true
+
+      def recordSuccess() = ()
+      def revived() = ()
+      def markDeadOnFailure(): Option[Duration] = {
+        if (markDead) {
+          markDead = false
+          Some(1.second)
+        } else None
+      }
+    }
+
+    val h = new Helper(policy)
+    import h._
+
+    Time.withCurrentTimeFrozen { tc =>
+
+      // Fail a request to mark dead
+      intercept[Exception] {
+        Await.result(service(123), 5.seconds)
+      }
+      assert(!factory.isAvailable)
+      assert(!service.isAvailable)
+
+      // Advance past period
+      tc.advance(2.seconds)
+      timer.tick()
+
+      // Although the underlying service is failing, the policy tells us
+      // we are healthy. Make sure we accept more requests to reconcile
+      // with the policy.
+      intercept[Exception] {
+        Await.result(service(123), 5.seconds)
+      }
+      assert(factory.isAvailable)
+      assert(service.isAvailable)
     }
   }
 
@@ -505,8 +560,12 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     when(underlying()) thenReturn Future.value(underlyingService)
 
     val factory = new FailureAccrualFactory[Int, Int](
-      underlying, FailureAccrualPolicy.consecutiveFailures(3, FailureAccrualFactory.jitteredBackoff), new MockTimer, statsReceiver, "test")
-    val service = Await.result(factory())
+      underlying = underlying,
+      policy = FailureAccrualPolicy.consecutiveFailures(3, FailureAccrualFactory.jitteredBackoff),
+      responseClassifier = ResponseClassifier.Default,
+      timer = new MockTimer,
+      statsReceiver = statsReceiver)
+    val service = Await.result(factory(), 5.seconds)
     verify(underlying)()
   }
 
@@ -543,8 +602,13 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     when(underlying.status) thenReturn Status.Open
     val exc = new Exception("i broked :-(")
     when(underlying()) thenReturn Future.exception(exc)
+    val timer = new MockTimer
     val factory = new FailureAccrualFactory[Int, Int](
-      underlying, FailureAccrualPolicy.consecutiveFailures(3, FailureAccrualFactory.jitteredBackoff), new MockTimer, statsReceiver, "test")
+      underlying,
+      FailureAccrualPolicy.consecutiveFailures(3, FailureAccrualFactory.jitteredBackoff),
+      ResponseClassifier.Default,
+      timer,
+      statsReceiver)
   }
 
   test("a broken factory should fail after the given number of tries") {
@@ -552,19 +616,26 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     import h._
 
     Time.withCurrentTimeFrozen { timeControl =>
-      assert(factory.isAvailable)
-      intercept[Exception] {
-        Await.result(factory())
-      }
-      assert(factory.isAvailable)
-      intercept[Exception] {
-        Await.result(factory())
-      }
-      assert(factory.isAvailable)
-      intercept[Exception] {
-        Await.result(factory())
+      for (i <- 1 to 3) {
+        assert(factory.isAvailable)
+        intercept[Exception] {
+          Await.result(factory(), 5.seconds)
+        }
       }
       assert(!factory.isAvailable)
+
+      // Advance past period
+      timeControl.advance(10.seconds)
+      timer.tick()
+
+      // Probing should fail due to factory exception. It should stop the probing and mark it dead again
+      intercept[Exception] {
+        Await.result(factory(), 5.seconds)
+      }
+      assert(statsReceiver.counters.get(List("probes")) == Some(1))
+      assert(statsReceiver.counters.get(List("removals")) == Some(1))
+      assert(!factory.isAvailable)
+      assert(factory.status == Status.Busy)
     }
   }
 
@@ -572,10 +643,10 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     class CustomizedFailureAccrualFactory(
         underlying: ServiceFactory[Int, Int],
         failureAccrualPolicy: FailureAccrualPolicy,
-        timer: Timer,
-        label: String)
+        responseClassifier: ResponseClassifier,
+        timer: Timer)
       extends FailureAccrualFactory[Int, Int](
-        underlying, failureAccrualPolicy, timer, NullStatsReceiver, label) {
+        underlying, failureAccrualPolicy, responseClassifier, timer, NullStatsReceiver) {
       override def isSuccess(reqRep: ReqRep): Boolean = {
         reqRep.response match {
           case Throw(_) => false
@@ -596,8 +667,11 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
 
     val timer = new MockTimer
     val factory = new CustomizedFailureAccrualFactory(
-      underlying, FailureAccrualPolicy.consecutiveFailures(3, Backoff.const(5.seconds)), timer, "test")
-    val service = Await.result(factory())
+      underlying,
+      FailureAccrualPolicy.consecutiveFailures(3, Backoff.const(5.seconds)),
+      ResponseClassifier.Default,
+      timer)
+    val service = Await.result(factory(), 5.seconds)
     verify(underlying)()
   }
 
@@ -606,13 +680,13 @@ class FailureAccrualFactoryTest extends FunSuite with MockitoSugar {
     import h._
 
     Time.withCurrentTimeFrozen { timeControl =>
-      assert(Await.result(service(123)) == 321)
-      assert(Await.result(service(123)) == 321)
+      assert(Await.result(service(123), 5.seconds) == 321)
+      assert(Await.result(service(123), 5.seconds) == 321)
       assert(factory.isAvailable)
       assert(service.isAvailable)
 
       // Now fail:
-      assert(Await.result(service(123)) == 321)
+      assert(Await.result(service(123), 5.seconds) == 321)
       assert(!service.isAvailable)
 
       verify(underlyingService, times(3))(123)

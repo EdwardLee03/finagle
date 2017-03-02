@@ -1,20 +1,43 @@
 package com.twitter.finagle
 
+import com.twitter.finagle.context.RemoteInfo
 import com.twitter.logging.{HasLogLevel, Level}
 import com.twitter.util.Duration
 import java.net.SocketAddress
+import scala.util.control.NoStackTrace
+
+/**
+ * A trait for exceptions that contain remote information:
+ * the downstream address/client id, upstream address/client id (if applicable), and trace id
+ * of the request. [[RemoteInfo.NotAvailable]] is used if no remote information
+ * has been set.
+ */
+trait HasRemoteInfo extends Exception {
+  private[this] var _remoteInfo: RemoteInfo = RemoteInfo.NotAvailable
+
+  def remoteInfo(): RemoteInfo = _remoteInfo
+
+  private[finagle] def setRemoteInfo(remoteInfo: RemoteInfo): Unit =
+    _remoteInfo = remoteInfo
+
+  def exceptionMessage(): String = super.getMessage()
+
+  override def getMessage(): String =
+    if (exceptionMessage == null) null
+    else s"$exceptionMessage. Remote Info: $remoteInfo"
+}
 
 /**
  * A trait for exceptions that have a source. The name of the source is
  * specified as a `serviceName`. The "unspecified" value is used if no
  * `serviceName` is provided by the implementation.
  */
-trait SourcedException extends Exception {
+trait SourcedException extends Exception with HasRemoteInfo {
   var serviceName: String = SourcedException.UnspecifiedServiceName
 }
 
 object SourcedException {
-  val UnspecifiedServiceName = "unspecified"
+  val UnspecifiedServiceName: String = "unspecified"
 
   def unapply(t: Throwable): Option[String] = t match {
     case sourced: SourcedException
@@ -28,38 +51,18 @@ object SourcedException {
 }
 
 /**
- * A trait for common exceptions that either
- *
- * a) don't benefit from full stacktrace information (e.g. stacktraces don't add
- *    useful information, as in the case of connection closure), or
- * b) are thrown frequently enough that stacktrace-creation becomes unacceptably
- *    expensive.
- *
- * This trait represents a tradeoff between debugging ease and efficiency.
- * Implementers beware.
- */
-trait NoStacktrace extends Exception {
-  override def fillInStackTrace = this
-  // specs expects non-empty stacktrace array
-  this.setStackTrace(NoStacktrace.NoStacktraceArray)
-}
-
-object NoStacktrace {
-  val NoStacktraceArray = Array(new StackTraceElement("com.twitter.finagle", "NoStacktrace", null, -1))
-}
-
-/**
  * A base class for request failures. Indicates that some failure occurred
  * before a request could be successfully serviced.
  */
 class RequestException(message: String, cause: Throwable)
   extends Exception(message, cause)
-  with NoStacktrace
+  with NoStackTrace
   with SourcedException
 {
   def this() = this(null, null)
   def this(cause: Throwable) = this(null, cause)
-  override def getStackTrace = if (cause != null) cause.getStackTrace else super.getStackTrace
+  override def getStackTrace: Array[StackTraceElement] =
+    if (cause != null) cause.getStackTrace else super.getStackTrace
 }
 
 /**
@@ -69,11 +72,12 @@ class RequestException(message: String, cause: Throwable)
  * its error message (e.g. the source and timeout value), and is only used
  * within the confines of Finagle.
  */
-trait TimeoutException extends SourcedException { self: Exception =>
+trait TimeoutException extends SourcedException with HasLogLevel { self: Exception =>
   protected val timeout: Duration
   protected def explanation: String
+  def logLevel: Level = Level.TRACE
 
-  override def getMessage = s"exceeded $timeout to $serviceName while $explanation"
+  override def exceptionMessage: String = s"exceeded $timeout to $serviceName while $explanation"
 }
 
 /**
@@ -83,9 +87,9 @@ trait TimeoutException extends SourcedException { self: Exception =>
  * different request granularities that this exception class can pertain to.
  */
 class RequestTimeoutException(
-  protected val timeout: Duration,
-  protected val explanation: String
-) extends RequestException with TimeoutException
+    protected val timeout: Duration,
+    protected val explanation: String)
+  extends RequestException with TimeoutException
 
 /**
  * Indicates that a single Finagle-level request timed out. In contrast to
@@ -129,14 +133,17 @@ class GlobalRequestTimeoutException(timeout: Duration)
  * [1] http://twitter.github.io/finagle/guide/Names.html
  */
 class NoBrokersAvailableException(
-  val name: String,
-  val baseDtab: Dtab,
-  val localDtab: Dtab
-) extends RequestException {
+    val name: String,
+    val baseDtab: Dtab,
+    val localDtab: Dtab)
+  extends RequestException
+  with SourcedException {
   def this(name: String = "unknown") = this(name, Dtab.empty, Dtab.empty)
 
-  override def getMessage =
+  override def exceptionMessage: String =
     s"No hosts are available for $name, Dtab.base=[${baseDtab.show}], Dtab.local=[${localDtab.show}]"
+
+  serviceName = name
 }
 
 /**
@@ -146,15 +153,21 @@ class NoBrokersAvailableException(
  * this exception. The client will cancel its pending request which will by
  * default propagate an interrupt to its downstream, and so on. This is done to
  * conserve resources.
+ *
+ * @see The [[http://twitter.github.io/finagle/guide/FAQ.html#what-are-cancelledrequestexception-and-cancelledconnectionexception user guide]]
+ *      for additional details.
  */
-class CancelledRequestException(cause: Throwable) extends RequestException(cause) {
+class CancelledRequestException(cause: Throwable)
+  extends RequestException(cause)
+  with HasLogLevel {
   def this() = this(null)
-  override def getMessage = {
+  override def exceptionMessage(): String = {
     if (cause == null)
       "request cancelled"
     else
       "request cancelled due to " + cause
   }
+  def logLevel: Level = Level.DEBUG
 }
 
 /**
@@ -162,7 +175,9 @@ class CancelledRequestException(cause: Throwable) extends RequestException(cause
  * failed because too many requests are already waiting for a connection to
  * become available from a client's connection pool.
  */
-class TooManyWaitersException extends RequestException
+class TooManyWaitersException extends RequestException with HasLogLevel {
+  def logLevel: Level = Level.DEBUG
+}
 
 /**
  * A Future is satisfied with this exception when the process of establishing
@@ -173,22 +188,39 @@ class TooManyWaitersException extends RequestException
  * during session establishment.
  *
  * @see com.twitter.finagle.CancelledRequestException
+ *
+ * @see The [[http://twitter.github.io/finagle/guide/FAQ.html#what-are-cancelledrequestexception-and-cancelledconnectionexception user guide]]
+ *      for additional details.
  */
-class CancelledConnectionException(cause: Throwable) extends RequestException(cause) {
+class CancelledConnectionException(cause: Throwable)
+  extends RequestException(cause)
+  with HasLogLevel {
   def this() = this(null)
+  def logLevel: Level = Level.DEBUG
 }
 
 /**
  * Used by [[com.twitter.finagle.service.FailFastFactory]] to indicate that a
  * request failed because all hosts in the cluster to which the client is
- * connected have been marked as failed. See FailFastFactory for details on
- * this behavior.
+ * connected have been marked as failed. See [[com.twitter.finagle.service.FailFastFactory]]
+ * for details on this behavior.
+ *
+ * @see The [[http://twitter.github.io/finagle/guide/FAQ.html#why-do-clients-see-com-twitter-finagle-failedfastexception-s user guide]]
+ *      for additional details.
  */
-class FailedFastException(message: String)
+class FailedFastException(message: String, private[finagle] val flags: Long = FailureFlags.Empty)
   extends RequestException(message, cause = null)
   with WriteException
+  with HasLogLevel
+  with FailureFlags[FailedFastException]
 {
+  protected def copyWithFlags(newFlags: Long): FailedFastException =
+    new FailedFastException(message, newFlags)
+
+  def this(message: String) = this(message, FailureFlags.Empty)
+
   def this() = this(null)
+  def logLevel: Level = Level.DEBUG
 }
 
 /**
@@ -212,7 +244,7 @@ class NotShardableException extends NotServableException
 class ShardNotAvailableException extends NotServableException
 
 object ChannelException {
-  def apply(cause: Throwable, remoteAddress: SocketAddress) = {
+  def apply(cause: Throwable, remoteAddress: SocketAddress): ChannelException = {
     cause match {
       case exc: ChannelException => exc
       case _: java.net.ConnectException                    => new ConnectionFailedException(cause, remoteAddress)
@@ -239,9 +271,9 @@ class ChannelException(underlying: Throwable, val remoteAddress: SocketAddress)
 {
   def this(underlying: Throwable) = this(underlying, null)
   def this() = this(null, null)
-  override def getMessage = {
+  override def exceptionMessage: String = {
     val message = (underlying, remoteAddress) match {
-      case (_, null) => super.getMessage
+      case (_, null) => super.exceptionMessage
       case (null, _) => s"ChannelException at remote address: ${remoteAddress.toString}"
       case (_, _) => s"${underlying.getMessage} at remote address: ${remoteAddress.toString}"
     }
@@ -258,7 +290,7 @@ class ChannelException(underlying: Throwable, val remoteAddress: SocketAddress)
  * particular category of connection failure.
  */
 class ConnectionFailedException(underlying: Throwable, remoteAddress: SocketAddress)
-  extends ChannelException(underlying, remoteAddress) with NoStacktrace {
+  extends ChannelException(underlying, remoteAddress) with NoStackTrace {
   def this() = this(null, null)
 }
 
@@ -267,16 +299,37 @@ class ConnectionFailedException(underlying: Throwable, remoteAddress: SocketAddr
  * was reset by a peer or a proxy.
  */
 class ChannelClosedException(underlying: Throwable, remoteAddress: SocketAddress)
-  extends ChannelException(underlying, remoteAddress) with NoStacktrace {
+  extends ChannelException(underlying, remoteAddress) with NoStackTrace {
   def this(remoteAddress: SocketAddress) = this(null, remoteAddress)
   def this() = this(null, null)
 }
 
 /**
- * Indicates that a write to a given `remoteAddress` timed out. See
- * [[com.twitter.finagle.netty3.channel.WriteCompletionTimeoutHandler]] for details.
+ * Indicates that a given stream was closed, for instance if the stream
+ * was reset by a peer or a proxy.
  */
-class WriteTimedOutException(remoteAddress: SocketAddress) extends ChannelException(null, remoteAddress) {
+class StreamClosedException(remoteAddress: SocketAddress, streamId: String)
+  extends ChannelException(null, remoteAddress) with NoStackTrace {
+  override def exceptionMessage: String = {
+    s"Stream: $streamId was closed at remote address: ${remoteAddress.toString}"
+  }
+}
+
+/**
+ * Indicates that a write to a given `remoteAddress` timed out.
+ */
+class WriteTimedOutException(
+    remoteAddress: SocketAddress)
+  extends ChannelException(null, remoteAddress) {
+  def this() = this(null)
+}
+
+/**
+ * Indicates that a read from a given `remoteAddress` timed out.
+ */
+class ReadTimedOutException(
+    remoteAddress: SocketAddress)
+  extends ChannelException(null, remoteAddress) {
   def this() = this(null)
 }
 
@@ -285,7 +338,8 @@ class WriteTimedOutException(remoteAddress: SocketAddress) extends ChannelExcept
  * some server. For example, the client could receive a channel-connection event
  * from a proxy when there is no outstanding connect request.
  */
-class InconsistentStateException(remoteAddress: SocketAddress) extends ChannelException(null, remoteAddress) {
+class InconsistentStateException(remoteAddress: SocketAddress)
+  extends ChannelException(null, remoteAddress) {
   def this() = this(null)
 }
 
@@ -309,22 +363,25 @@ object WriteException {
 }
 
 /**
- * Marker trait to indicate there was an exception while writing the request.
- * These exceptions should generally be retryable as the full request should
- * not have reached the other end.
+ * Marker trait to indicate there was an exception before writing any of the
+ * request.
+ * These exceptions should generally be retryable.
+ *
+ * @see [[com.twitter.finagle.service.RetryPolicy.RetryableWriteException]]
+ * @see [[com.twitter.finagle.service.RetryPolicy.WriteExceptionsOnly]]
  */
 trait WriteException extends Exception with SourcedException
 
 /**
- * Default implementation for WriteException that wraps an underlying exception.
+ * Default implementation for [[WriteException]] that wraps an underlying exception.
  */
 case class ChannelWriteException(underlying: Throwable)
   extends ChannelException(underlying)
   with WriteException
-  with NoStacktrace
+  with NoStackTrace
 {
-  override def fillInStackTrace = this
-  override def getStackTrace = underlying.getStackTrace
+  override def fillInStackTrace: NoStackTrace = this
+  override def getStackTrace: Array[StackTraceElement] = underlying.getStackTrace
 }
 
 /**
@@ -364,13 +421,6 @@ case class RefusedByRateLimiter() extends ChannelException
 class TransportException extends Exception with SourcedException
 
 /**
- * Indicates that a request failed because a
- * [[com.twitter.finagle.transport.Transport]] write associated with the request
- * was cancelled.
- */
-class CancelledWriteException extends TransportException
-
-/**
  * Indicates that a [[com.twitter.finagle.transport.Transport]] write associated
  * with the request was dropped by the transport (usually to respect backpressure).
  */
@@ -401,8 +451,9 @@ class ServiceTimeoutException(override protected val timeout: Duration)
   extends WriteException
   with ServiceException
   with TimeoutException
+  with NoStackTrace
 {
-  override protected def explanation =
+  override protected def explanation: String =
     "creating a service/connection or reserving a service/connection from the service/connection pool " + serviceName
 }
 
@@ -430,8 +481,8 @@ class ChannelBufferUsageException(description: String) extends Exception(descrip
 /**
  * An exception that is raised on requests that are discarded because
  * their corresponding backup requests succeeded first. See
- * [[com.twitter.finagle.exp.BackupRequestFilter]] for details.
+ * `com.twitter.finagle.exp.BackupRequestFilter` for details.
  */
-object BackupRequestLost extends Exception with NoStacktrace with HasLogLevel {
+object BackupRequestLost extends Exception with NoStackTrace with HasLogLevel {
   def logLevel: Level = Level.TRACE
 }

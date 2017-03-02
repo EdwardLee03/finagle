@@ -37,37 +37,47 @@ trait Codec[Req, Rep] {
    * Prepare a connection factory. Used to allow codec modifications
    * to the service at the bottom of the stack (connection level).
    */
+  final def prepareConnFactory(underlying: ServiceFactory[Req, Rep]): ServiceFactory[Req, Rep] =
+    prepareConnFactory(underlying, Stack.Params.empty)
+
   def prepareConnFactory(
-    underlying: ServiceFactory[Req, Rep]
-  ): ServiceFactory[Req, Rep] =
-    underlying
+    underlying: ServiceFactory[Req, Rep],
+    params: Stack.Params
+  ): ServiceFactory[Req, Rep] = underlying
 
   /**
    * Note: the below ("raw") interfaces are low level, and require a
    * good understanding of finagle internals to implement correctly.
    * Proceed with care.
    */
-
   def newClientTransport(ch: Channel, statsReceiver: StatsReceiver): Transport[Any, Any] =
     new ChannelTransport(ch)
 
-  def newClientDispatcher(transport: Transport[Any, Any]): Service[Req, Rep] =
+  final def newClientDispatcher(transport: Transport[Any, Any]): Service[Req, Rep] =
     newClientDispatcher(transport, Stack.Params.empty)
 
   def newClientDispatcher(
     transport: Transport[Any, Any],
     params: Stack.Params
-  ): Service[Req, Rep] =
+  ): Service[Req, Rep] = {
+    // In order to not break the Netty 3 API, we provide some 'alternative facts'
+    // and continue without our dynamic check
+    val clazz = classOf[Any].asInstanceOf[Class[Rep]]
     new SerialClientDispatcher(
-      Transport.cast[Req, Rep](transport),
+      Transport.cast[Req, Rep](clazz, transport),
       params[param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
     )
+  }
 
   def newServerDispatcher(
     transport: Transport[Any, Any],
     service: Service[Req, Rep]
-  ): Closable =
-    new SerialServerDispatcher[Req, Rep](Transport.cast[Rep, Req](transport), service)
+  ): Closable = {
+    // In order to not break the Netty 3 API, we provide some 'alternative facts'
+    // and continue without our dynamic check
+    val clazz = classOf[Any].asInstanceOf[Class[Req]]
+    new SerialServerDispatcher[Req, Rep](Transport.cast[Rep, Req](clazz, transport), service)
+  }
 
   /**
    * Is this Codec OK for failfast? This is a temporary hack to

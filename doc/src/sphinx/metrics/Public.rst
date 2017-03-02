@@ -12,17 +12,20 @@ StatsFilter
 **request_latency_ms**
   A histogram of the latency of requests in milliseconds.
 
-**load**
-  A gauge of the current total number of outstanding requests.
-
 **pending**
-  A gauge of the current total number of outstanding requests (same as "load").
+  A gauge of the current total number of outstanding requests.
 
 **failures/<exception_name>+**
   A counter of the number of times a specific exception has been thrown.
+  If you are using a ``ResponseClassifier`` that classifies non-Exceptions
+  as failures, it will use a synthetic Exception,
+  ``com.twitter.finagle.service.ResponseClassificationSyntheticException``,
+  to account for these. See the
+  `FAQ <http://twitter.github.io/finagle/guide/FAQ.html#what-is-a-com-twitter-finagle-service-responseclassificationsyntheticexception>`_
+  for more details.
 
 **failures**
-  A counter of the number of times any exception has been thrown.
+  A counter of the number of times any failure has been observed.
 
 **sourcedfailures/<source_service_name>{/<exception_name>}+**
   A counter of the number of times a specific
@@ -71,12 +74,8 @@ ServerStatsFilter
 
 **transit_latency_ms**
   A stat that attempts to measure (wall time) transit times between hops, e.g.,
-  from client to server. Be aware that clock drift between hosts and other factors
-  can contribute here. Not supported by all protocols.
-
-**deadline_budget_ms**
-  A stat accounting for the (implied) amount of time remaining for this request,
-  for example from a deadline or timeout. Not supported by all protocols.
+  from client to server. Be aware that clock drift between hosts, stop the world
+  pauses, and queue backups can contribute here. Not supported by all protocols.
 
 RequestSemaphoreFilter
 <<<<<<<<<<<<<<<<<<<<<<
@@ -89,3 +88,12 @@ RequestSemaphoreFilter
 **request_queue_size**
   A gauge of the total number of requests which are waiting because of the limit
   on simultaneous requests.
+
+PayloadSizeFilter (enabled for Mux, HTTP (non-chunked), Thrift)
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+**request_payload_bytes**
+  A histogram of the number of bytes per request's payload.
+
+**response_payload_bytes**
+  A histogram of the number of bytes per response's payload.

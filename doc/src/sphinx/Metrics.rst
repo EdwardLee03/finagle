@@ -104,6 +104,16 @@ These client stats help you keep track of connection churn.
 
 .. include:: metrics/Pooling.rst
 
+PendingRequestFilter
+--------------------
+
+.. _pending_request_filter:
+
+These stats represent information about the behavior of PendingRequestFilter.
+
+**pending_requests/rejected**
+  a counter of the number of requests that have been rejected by this filter.
+
 Retries
 -------
 
@@ -140,15 +150,6 @@ strategies.
 
 .. include:: metrics/AdmissionControl.rst
 
-Mux
----
-
-.. _mux_stats:
-
-These stats pertain to the :ref:`Mux <mux>` protocol.
-
-.. include:: metrics/Mux.rst
-
 Threshold Failure Detector
 --------------------------
 
@@ -181,6 +182,14 @@ These metrics track the state of name resolution and service discovery.
 
 .. include:: metrics/ServiceDiscovery.rst
 
+Toggles
+-------
+
+These metrics correspond to :ref:`feature toggles <toggles>`.
+
+**toggles/<libraryName>/checksum**
+  A gauge summarizing the current state of a `ToggleMap` which may be useful
+  for comparing state across a cluster or over time.
 
 HTTP
 ----
@@ -190,4 +199,59 @@ These stats pertain to the HTTP protocol.
 
 **nacks**
   A counter of the number of retryable HTTP 503 responses the Http server returns. Those
-  responses are automatically retried by Finagle Http client.
+  responses are automatically retried by Finagle HTTP client.
+
+**nonretryable_nacks**
+  A counter of the number of non-retryable HTTP 503 responses the HTTP server returns. Those
+  responses are not automatically retried.
+
+These metrics are added by
+:src:`StatsFilter <com/twitter/finagle/http/filter/StatsFilter.scala>` and can be enabled by
+using `.withHttpStats` on `Http.Client` and `Http.Server`.
+
+**status/<statusCode>**
+  A counter of the number of responses received, or returned for servers, that had this
+  statusCode.
+
+**status/<statusClass>**
+  Same as **status/statusCode** but aggregated per category, e.g. all 500 range responses
+  count as 5XX for this counter.
+
+**time/<statusCode>**
+  A histogram on duration in milliseconds per HTTP status code.
+
+**time/<statusCategory>**
+  A histogram on duration in milliseconds per HTTP status code category.
+
+HTTP2
+-----
+These stats pertain to HTTP2 only.
+
+.. include:: metrics/Http2.rst
+
+Memcached
+---------
+
+.. _memcached_stats:
+
+These stats pertain to the Memcached protocol.
+
+.. include:: metrics/Memcached.rst
+
+Mux
+---
+
+.. _mux_stats:
+
+These stats pertain to the :ref:`Mux <mux>` protocol.
+
+.. include:: metrics/Mux.rst
+
+ThriftMux
+---------
+
+.. _thriftmux_stats:
+
+These stats pertain to the :ref:`ThriftMux <whats_thriftmux>` protocol.
+
+.. include:: metrics/ThriftMux.rst

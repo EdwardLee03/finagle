@@ -51,10 +51,10 @@ object Trace {
     "com.twitter.finagle.tracing.TraceContext"
   ) {
     private val local = new ThreadLocal[Array[Byte]] {
-      override def initialValue() = new Array[Byte](32)
+      override def initialValue(): Array[Byte] = new Array[Byte](32)
     }
 
-    def marshal(id: TraceId) =
+    def marshal(id: TraceId): Buf =
       Buf.ByteArray.Owned(TraceId.serialize(id))
 
     /**
@@ -248,16 +248,21 @@ object Trace {
   }
 
   /**
-   * Returns true if tracing is enabled with a good tracer pushed and the current
-   * trace is sampled
+   * Returns true if tracing is enabled with a good tracer pushed and at least one tracer
+   * decides to actively trace the current [[id]]
    */
-  def isActivelyTracing: Boolean =
-    tracingEnabled && (id match {
-        case TraceId(_, _, _, Some(false), flags) if !flags.isDebug => false
-        case TraceId(_, _, _, _, Flags(Flags.Debug)) => true
-        case _ =>
-          tracers.nonEmpty && (tracers.size > 1 || tracers.head != NullTracer)
-      })
+  def isActivelyTracing: Boolean = {
+    if (!tracingEnabled)
+      return false
+
+    // store `tracers` and `id` in local vars to avoid repeated `Context` lookups
+    val ts = tracers
+    if (ts.isEmpty)
+      return false
+
+    val tid = id
+    ts.exists(_.isActivelyTracing(tid))
+  }
 
   /**
    * Record a raw record without checking if it's sampled/enabled/etc.

@@ -1,16 +1,17 @@
 package com.twitter.finagle.server
 
 import com.twitter.conversions.time._
-import com.twitter.finagle.Stack.Param
 import com.twitter.finagle._
 import com.twitter.finagle.filter._
 import com.twitter.finagle.param._
-import com.twitter.finagle.service.{DeadlineFilter, StatsFilter, TimeoutFilter}
+import com.twitter.finagle.service.{ExpiringService, StatsFilter, TimeoutFilter}
 import com.twitter.finagle.stack.Endpoint
+import com.twitter.finagle.Stack.{Role, Param}
 import com.twitter.finagle.stats.ServerStatsReceiver
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
 import com.twitter.jvm.Jvm
+import com.twitter.util.registry.GlobalRegistry
 import com.twitter.util.{Closable, CloseAwaitably, Future, Return, Throw, Time}
 import java.net.SocketAddress
 import java.util.Collections
@@ -18,7 +19,18 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.collection.JavaConverters._
 
 object StackServer {
-  private[this] val newJvmFilter = new MkJvmFilter(Jvm())
+
+  private[this] lazy val newJvmFilter = new MkJvmFilter(Jvm())
+
+  private[this] class JvmTracing[Req, Rep] extends Stack.Module1[param.Tracer, ServiceFactory[Req, Rep]] {
+    override def role: Role = Role.jvmTracing
+    override def description: String = "Server-side JVM tracing"
+    override def make(_tracer: param.Tracer, next: ServiceFactory[Req, Rep]): ServiceFactory[Req, Rep] = {
+      val param.Tracer(tracer) = _tracer
+      if (tracer.isNull) next
+      else newJvmFilter[Req, Rep].andThen(next)
+    }
+  }
 
   /**
    * Canonical Roles for each Server-related Stack modules.
@@ -38,7 +50,6 @@ object StackServer {
    *
    * @see [[com.twitter.finagle.tracing.ServerDestTracingProxy]]
    * @see [[com.twitter.finagle.service.TimeoutFilter]]
-   * @see [[com.twitter.finagle.service.DeadlineFilter]]
    * @see [[com.twitter.finagle.filter.DtabStatsFilter]]
    * @see [[com.twitter.finagle.service.StatsFilter]]
    * @see [[com.twitter.finagle.filter.RequestSemaphoreFilter]]
@@ -50,18 +61,15 @@ object StackServer {
    * @see [[com.twitter.finagle.filter.ServerStatsFilter]]
    */
   def newStack[Req, Rep]: Stack[ServiceFactory[Req, Rep]] = {
-    val stk = new StackBuilder[ServiceFactory[Req, Rep]](
-      stack.nilStack[Req, Rep])
+    val stk = new StackBuilder[ServiceFactory[Req, Rep]](stack.nilStack[Req, Rep])
 
+    // We want to start expiring services as close to their instantiation
+    // as possible. By installing `ExpiringService` here, we are guaranteed
+    // to wrap the server's dispatcher.
+    stk.push(ExpiringService.server)
     stk.push(Role.serverDestTracing, ((next: ServiceFactory[Req, Rep]) =>
       new ServerDestTracingProxy[Req, Rep](next)))
     stk.push(TimeoutFilter.serverModule)
-    // The DeadlineFilter is pushed after the stats filters so stats are
-    // recorded for the request. If a server processing deadline is set in
-    // TimeoutFilter, the deadline will start from the current time, and
-    // therefore not be expired if the request were to then pass through
-    // DeadlineFilter. Thus, DeadlineFilter is pushed before TimeoutFilter.
-    stk.push(DeadlineFilter.module)
     stk.push(DtabStatsFilter.module)
     // Admission Control filters are inserted after `StatsFilter` so that rejected
     // requests are counted. We may need to adjust how latency are recorded
@@ -71,8 +79,7 @@ object StackServer {
     stk.push(RequestSemaphoreFilter.module)
     stk.push(MaskCancelFilter.module)
     stk.push(ExceptionSourceFilter.module)
-    stk.push(Role.jvmTracing, ((next: ServiceFactory[Req, Rep]) =>
-      newJvmFilter[Req, Rep]() andThen next))
+    stk.push(new JvmTracing)
     stk.push(ServerStatsFilter.module)
     stk.push(Role.protoTracing, identity[ServiceFactory[Req, Rep]](_))
     stk.push(ServerTracingFilter.module)
@@ -81,7 +88,7 @@ object StackServer {
     // any Tracing produced by those modules is enclosed in the appropriate
     // span.
     stk.push(TraceInitializerFilter.serverModule)
-    stk.push(MonitorFilter.module)
+    stk.push(MonitorFilter.serverModule)
     stk.result
   }
 
@@ -120,17 +127,26 @@ trait StackServer[Req, Rep]
   override def configured[P: Param](p: P): StackServer[Req, Rep]
 
   override def configured[P](psp: (P, Param[P])): StackServer[Req, Rep]
+
+  override def configuredParams(params: Stack.Params): StackServer[Req, Rep]
 }
 
 /**
  * A standard template implementation for
  * [[com.twitter.finagle.server.StackServer]].
+ *
+ * @see The [[http://twitter.github.io/finagle/guide/Servers.html user guide]]
+ *      for further details on Finagle servers and their configuration.
+ *
+ * @see [[StackServer.newStack]] for the default modules used by Finagle
+ *      servers.
  */
 trait StdStackServer[Req, Rep, This <: StdStackServer[Req, Rep, This]]
   extends StackServer[Req, Rep]
   with Stack.Parameterized[This]
   with CommonParams[This]
   with WithServerTransport[This]
+  with WithServerSession[This]
   with WithServerAdmissionControl[This] { self =>
 
   /**
@@ -171,6 +187,13 @@ trait StdStackServer[Req, Rep, This <: StdStackServer[Req, Rep, This]]
   override def configured[P](psp: (P, Stack.Param[P])): This = {
     val (p, sp) = psp
     configured(p)(sp)
+  }
+
+  /**
+   * Creates a new StackServer with additional parameters `newParams`.
+   */
+  override def configuredParams(newParams: Stack.Params): This = {
+    withParams(params ++ newParams)
   }
 
   /**
@@ -240,8 +263,19 @@ trait StdStackServer[Req, Rep, This <: StdStackServer[Req, Rep, This]]
       // Listen over `addr` and serve traffic from incoming transports to
       // `serviceFactory` via `newDispatcher`.
       val listener = server.newListener()
+
+      // Export info about the listener type so that we can query info
+      // about its implementation at runtime. This assumes that the `toString`
+      // of the implementation is sufficiently descriptive.
+      val listenerImplKey = Seq(
+        ServerRegistry.registryName,
+        params[ProtocolLibrary].name,
+        params[Label].label,
+        "Listener")
+      GlobalRegistry.get.put(listenerImplKey, listener.toString)
+
       val underlying = listener.listen(addr) { transport =>
-        serviceFactory(newConn(transport)) respond {
+        serviceFactory(newConn(transport)).respond {
           case Return(service) =>
             val d = server.newDispatcher(transport, service)
             connections.add(d)

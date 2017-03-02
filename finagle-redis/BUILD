@@ -1,4 +1,4 @@
-target(name='finagle-redis',
+target(
   dependencies=[
     'finagle/finagle-redis/src/main/scala'
   ]
@@ -6,7 +6,6 @@ target(name='finagle-redis',
 
 target(name='tests',
   dependencies=[
-    'finagle/finagle-redis/src/test/java',
     'finagle/finagle-redis/src/test/scala'
   ]
 )

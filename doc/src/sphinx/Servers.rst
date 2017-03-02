@@ -44,7 +44,8 @@ behavior lives in the :ref:`clients <finagle_clients>`.
 
 .. figure:: _static/serverstack.svg
 
-    Fig. 1: A visual representation of each module in a default Finagle server. Requests flow from left to right.
+    Fig. 1: A visual representation of each module in a default Finagle server.
+    Requests flow from left to right.
 
 Many of the server modules act as `admission controllers` that make a decision (based on either a dynamic or
 static property) whether this server can handle the incoming request while maintaining some SLO (Service Level
@@ -65,6 +66,8 @@ All the unhandled exceptions from a user-defined service flow through the ``Moni
 used by the given Finagle server. See :ref:`this example <configuring_monitors>` on how to
 override the default instance that simply logs exceptions onto a the standard output.
 
+.. include:: shared-modules/ResponseClassification.rst
+
 Concurrency Limit
 ^^^^^^^^^^^^^^^^^
 
@@ -83,7 +86,7 @@ that might be handled concurrently by your server, use the following example [#e
   val server = Http.server
     .withAdmissionControl.concurrencyLimit(
       maxConcurrentRequests = 10,
-      maxWaiters = 0,
+      maxWaiters = 0
     )
     .serve(":8080", service)
 
@@ -93,44 +96,31 @@ The `Concurrency Limit` module is configured with two parameters:
 2. `maxWaiters` - the number of requests (on top of `maxConcurrentRequests`) allowed to be queued
 
 All the incoming requests on top of ``(maxConcurrentRequests + maxWaiters)`` will be
-`rejected`[#nack]_ by the server. That said, the `Concurrency Limit` module acts as
+`rejected` [#nack]_ by the server. That said, the `Concurrency Limit` module acts as
 `static admission controller` monitoring the current concurrency level of the incoming requests.
 
 See :ref:`Requests Concurrency metrics <requests_concurrency_limit>` for more details.
 
-Request Deadline
-^^^^^^^^^^^^^^^^
+Rejecting Requests
+^^^^^^^^^^^^^^^^^^
 
-The `Request Deadline` module acts as deadline driven server-side `static admission controller` and
-`rejects` [#nack]_ all the incoming requests that expire their deadline. Generally, the deadline for
-each request is set up by a frontend service and propagated over the wire to the downstream services.
-
-The `Request Deadline` module is implemented by
-:src:`DeadlineFilter <com/twitter/finagle/filter/DeadlineFilter.scala>` and configured with
-following params [#example]_.
+A service may explicitly reject requests on a case-by-case basis. To generate a rejection response,
+have the server return a Future.exception of :src:`Failure <com/twitter/finagle/Failure.scala>` with
+the `Rejected` flag set. A convenience method, `Failure.rejected` exists for this. By default, this
+also sets the `Restartable` flag which indicates the failure is safe to retry. The client's
+:src:`RequeueFilter <com/twitter/finagle/service/RequeueFilter.scala>` will automatically retry such
+failures.
+For requests that should not be retried, the server should return a `Failure` with the `NonRetryable`
+flag set.
 
 .. code-block:: scala
 
-  import com.twitter.conversions.time._
-  import com.twitter.finagle.Http
+  import com.twitter.finagle.Failure
 
-  val server = Http.server
-    .withAdmissionControl.deadlineTolerance(200.milliseconds)
-    .withAdmissionControl.deadlineMaxRejectedPercentage(0.3)
-    .serve(":8080", service)
+  val rejection = Future.exception(Failure.rejected("busy"))
+  val nonRetryable = Future.exception(Failure("Don't try again", Failure.Rejected|Failure.NonRetryable))
 
-There are two arguments passed to the `Request Deadline` module, which might be configured
-separately:
-
-1. `deadlineTolerance` (default: 170 ms) - the maximum elapsed time since a request's deadline
-   when it will be considered for rejection
-2. `deadlineMaxRejectedPercentage` (default: 20%) - the maximum percentage of requests that can be
-   rejected
-
-See :ref:`Deadline Admission Control metrics <deadline_admission_control_stats>` for more details.
-
-.. note:: The `Request Deadline` module is currently in an experimental mode where it doesn't actually
-          reject any of the `expired` requests, but only maintains metrics.
+These responses will be considered `rejected` [#nack]_ by Finagle.
 
 Request Timeout
 ^^^^^^^^^^^^^^^
@@ -148,9 +138,37 @@ Finagle clients, this module is disabled by default (the timeout is unbounded). 
 
 .. rubric:: Footnotes
 
-.. [#nack] Depending on the protocol, a rejected request might be transformed into a `NACK`
-   (currently supported in HTTP/1.1 and Mux) so the remote client can safely `retry` it.
+.. [#nack] Depending on the protocol, a rejected request might be transformed into a :ref:`nack <glossary_nack>`
+   (currently supported in HTTP/1.1 and Mux) message.
 
 .. [#example] Configuration parameters/values provided in this example are only demonstrate
    the API usage, not the real world values. We do not recommend blindly applying those values
    to production systems.
+
+Session Expiration
+^^^^^^^^^^^^^^^^^^
+In certain cases, it may be useful for the server to control its resources via bounding
+the lifetime of a session. The `Session Expiration` module is attached at the connection level
+and expires a service/session after a certain amount of idle time. The module is
+implemented by :src:`ExpiringService <com/twitter/finagle/service/ExpiringService.scala>`.
+
+The default setting for the `Expiration` module is to never expire a session. Here is how
+it can be configured [#example]_.
+
+.. code-block:: scala
+
+  import com.twitter.conversions.time._
+  import com.twitter.finagle.Http
+
+  val twitter = Http.server
+    .withSession.maxLifeTime(20.seconds)
+    .withSession.maxIdleTime(10.seconds)
+    .newService("twitter.com")
+
+The `Expiration` module takes two parameters:
+
+1. `maxLifeTime` - the maximum duration for which a session is considered alive
+2. `maxIdleTime` - the maximum duration for which a session is allowed to idle
+   (not sending any requests)
+
+See :ref:`Expiration metrics <idle_apoptosis_stats>` for more details.

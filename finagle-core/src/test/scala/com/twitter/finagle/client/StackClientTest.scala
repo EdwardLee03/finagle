@@ -15,15 +15,16 @@ import com.twitter.finagle.service.PendingRequestFilter
 import com.twitter.finagle.stats.InMemoryStatsReceiver
 import com.twitter.finagle.transport.Transport
 import com.twitter.finagle.util.StackRegistry
-import com.twitter.finagle.{param, Name}
+import com.twitter.finagle.{Name, param}
 import com.twitter.util._
-import java.net.{InetAddress, InetSocketAddress}
+import com.twitter.util.registry.{Entry, GlobalRegistry, SimpleRegistry}
+import java.net.{InetAddress, InetSocketAddress, SocketAddress}
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.runner.RunWith
 import org.scalatest.{BeforeAndAfter, FunSuite}
 import org.scalatest.concurrent.{Eventually, IntegrationPatience}
-import org.scalatest.junit.{AssertionsForJUnit, JUnitRunner}
+import org.scalatest.junit.JUnitRunner
 
 private object StackClientTest {
   case class LocalCheckingStringClient(
@@ -40,8 +41,8 @@ private object StackClientTest {
     protected type In = String
     protected type Out = String
 
-    protected def newTransporter(): Transporter[String, String] =
-      Netty3Transporter(StringClientPipeline, params)
+    protected def newTransporter(addr: SocketAddress): Transporter[String, String] =
+      Netty3Transporter(StringClientPipeline, addr, params)
 
     protected def newDispatcher(
       transport: Transport[In, Out]
@@ -62,10 +63,9 @@ private object StackClientTest {
 class StackClientTest extends FunSuite
   with StringClient
   with StringServer
-  with AssertionsForJUnit
+  with BeforeAndAfter
   with Eventually
-  with IntegrationPatience
-  with BeforeAndAfter {
+  with IntegrationPatience {
 
   trait Ctx {
     val sr = new InMemoryStatsReceiver
@@ -102,8 +102,8 @@ class StackClientTest extends FunSuite
     ClientRegistry.clear()
 
     val name = "testClient"
-    client.newClient(Name.bound(new InetSocketAddress(8080)), name)
-    client.newClient(Name.bound(new InetSocketAddress(8080)), name)
+    client.newClient(Name.bound(Address(8080)), name)
+    client.newClient(Name.bound(Address(8080)), name)
 
     assert(ClientRegistry.registrants.count { e: StackRegistry.Entry =>
       val param.Label(actual) = e.params[param.Label]
@@ -120,7 +120,7 @@ class StackClientTest extends FunSuite
       val description = "lool"
 
       def make(next: ServiceFactory[String, String]) =
-        ServiceFactory.apply(() => Future.exception(ex))
+        ServiceFactory.apply[String, String](() => Future.exception(ex))
     }
 
     val alwaysFailStack = new StackBuilder(stack.nilStack[String, String])
@@ -373,8 +373,8 @@ class StackClientTest extends FunSuite
     val fac1 = new CountFactory
     val fac2 = new CountFactory
 
-    val addr1 = new InetSocketAddress(1729)
-    val addr2 = new InetSocketAddress(1730)
+    val addr1 = Address(1729)
+    val addr2 = Address(1730)
 
     val baseDtab = Dtab.read("/s=>/test")
 
@@ -415,7 +415,7 @@ class StackClientTest extends FunSuite
         param.Stats(sr) +
         BindingFactory.BaseDtab(() => baseDtab)))
 
-    intercept[ChannelWriteException] {
+    intercept[Failure] {
       Await.result(service(()), 5.seconds)
     }
 
@@ -445,11 +445,11 @@ class StackClientTest extends FunSuite
       client.configured[param.Label]((param.Label("foo"), param.Label.param))
   }
 
-  test("StackClient binds to a local service via ServiceFactorySocketAddress") {
+  test("StackClient binds to a local service via exp.Address.ServiceFactory") {
     val reverser = Service.mk[String, String] { in => Future.value(in.reverse) }
     val sf = ServiceFactory(() => Future.value(reverser))
-    val sa = ServiceFactorySocketAddress(sf)
-    val name = Name.bound(sa)
+    val addr = exp.Address(sf)
+    val name = Name.bound(addr)
     val service = stringClient.newService(name, "sfsa-test")
     val forward = "a man a plan a canal: panama"
     val reversed = Await.result(service(forward), 1.second)
@@ -459,8 +459,8 @@ class StackClientTest extends FunSuite
   test("filtered composes filters atop the stack") {
     val echoServer = Service.mk[String, String] { in => Future.value(in) }
     val sf = ServiceFactory(() => Future.value(echoServer))
-    val sa = ServiceFactorySocketAddress(sf)
-    val name = Name.bound(sa)
+    val addr = exp.Address(sf)
+    val name = Name.bound(addr)
 
     val reverseFilter = new SimpleFilter[String, String] {
       def apply(str: String, svc: Service[String, String]) =
@@ -471,7 +471,6 @@ class StackClientTest extends FunSuite
     assert(Await.result(svc.ping(), 1.second) == "ping".reverse)
   }
 
-
   test("endpointer clears Contexts") {
     import StackClientTest._
 
@@ -481,9 +480,10 @@ class StackClientTest extends FunSuite
       val server = stringServer.serve(
         new InetSocketAddress(InetAddress.getLoopbackAddress, 0),
         echoSvc)
+      val ia = server.boundAddress.asInstanceOf[InetSocketAddress]
 
       val client = new LocalCheckingStringClient(key)
-        .newService(Name.bound(server.boundAddress), "a-label")
+        .newService(Name.bound(Address(ia)), "a-label")
 
       val result = Await.result(client("abc"), 5.seconds)
       assert("abc" == result)
@@ -586,5 +586,28 @@ class StackClientTest extends FunSuite
     Await.result(e2r6, 3.seconds)
 
     assert(endpoint2.satisfied.get() == 5)
+  }
+
+  test("exports transporter type to registry") {
+    val listeningServer = stringServer
+      .serve(":*", Service.mk[String, String](Future.value(_)))
+    val boundAddress = listeningServer.boundAddress.asInstanceOf[InetSocketAddress]
+
+    val label = "stringClient"
+    val svc = stringClient.newService(Name.bound(Address(boundAddress)), label)
+
+    val registry = new SimpleRegistry
+    Await.result(GlobalRegistry.withRegistry(registry) {
+      svc("hello world")
+    }, 5.seconds)
+
+    val expectedEntry = Entry(
+      key = Seq("client", StringClient.protocolLibrary, label, "Transporter"),
+      value = "Netty3Transporter")
+
+    assert(registry.iterator.contains(expectedEntry))
+
+    Await.result(listeningServer.close(), 5.seconds)
+    Await.result(svc.close(), 5.seconds)
   }
 }

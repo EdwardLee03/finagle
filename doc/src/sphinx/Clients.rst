@@ -38,6 +38,62 @@ does exactly this. For cases like Thrift, where IDLs are part of
 the rich API, a more specialized API is exposed. See the protocols section on
 :ref:`Thrift <thrift_and_scrooge>` for more details.
 
+Transport
+---------
+
+Finagle clients come with a variety of transport-level parameters that not only wire up TCP socket
+options, but also upgrade the transport protocol to support encryption (e.g. TLS/SSL) and proxy
+servers (e.g. HTTP, SOCKS5).
+
+HTTP Proxy
+~~~~~~~~~~
+
+There is built-in support for `tunneling TCP-based protocols <http://www.web-cache.com/Writings/Internet-Drafts/draft-luotonen-web-proxy-tunneling-01.txt>`_
+through web proxy servers in a default Finagle client that might be used with any TCP traffic, not
+only HTTP(S). See `Squid documentation <http://wiki.squid-cache.org/Features/HTTPS>`_ on this feature.
+
+The following example enables tunneling HTTP traffic through a web proxy server `my-proxy-server.com`
+to `twitter.com`.
+
+.. code-block:: scala
+
+  import com.twitter.finagle.{Service, Http}
+  import com.twitter.finagle.http.{Request, Response}
+  import com.twitter.finagle.client.Transporter
+  import java.net.SocketAddress
+
+  val twitter: Service[Request, Response] = Http.client
+    .configured(Transporter.HttpProxy(Some(new InetSocketAddress("my-proxy-server.com", 3128))))
+    .withSessionQualifier.noFailFast
+    .newService("twitter.com")
+
+
+.. note::
+
+  The web proxy server, represented as a static `SocketAddress`, acts as a single point of failure
+  for a client. Whenever a proxy server is down, no traffic is served through the client no matter
+  how big its replica set. This is why :ref:`Fail Fast <client_fail_fast>` is disabled on this
+  client.
+
+  There is better HTTP proxy support coming to Finagle along with the Netty 4 upgrade.
+
+SOCKS5 Proxy
+~~~~~~~~~~~~
+
+SOCKS5 proxy support in Finagle is designed and implemented exclusively for testing/development
+(assuming that SOCKS proxy is provided via `ssh -D`), not for production usage. For production
+traffic, an HTTP proxy should be used instead.
+
+Use the following CLI flags to enable SOCKS proxy on every Finagle client on a given JVM instance
+(username and password are optional).
+
+.. code-block:: shell
+
+  -com.twitter.finagle.socks.socksProxyHost=localhost \
+  -com.twitter.finagle.socks.socksProxyPort=50001 \
+  -com.twitter.finagle.socks.socksUsername=$TheUsername \
+  -com.twitter.finagle.socks.socksPassword=$ThePassword
+
 .. _client_modules:
 
 Client Modules
@@ -103,6 +159,8 @@ output. To override this, use the following sample.
 
 Finally, clients have built-in support for `Zipkin <http://zipkin.io/>`_.
 
+.. _retries:
+
 Retries
 ~~~~~~~
 
@@ -115,6 +173,14 @@ bytes were written to the wire and protocol level NACKs) will be automatically r
 These retries come out of a ``RetryBudget`` that allows for approximately 20% of the total requests
 to be retried on top of 10 retries per second in order to accommodate clients that have just started
 issuing requests or clients that have a low rate of requests per second.
+
+Some failures may also be known as unsafe to retry. If a :src:`Failure <com/twitter/finagle/Failure.scala>`
+is flagged ``NonRetryable``, the `Retries` module will not make any attempts to retry the request and
+pass along the failure as is. A `NonRetryable` failure may be used in situations where a client
+determines that a service is unhealthy and wishes to signal that the normal pattern of retries should
+be skipped. Additionally, a service may reject a request that is malformed and thus pointless to retry.
+While Finagle respects the `NonRetryable` flag internally, users should also take care to respect it
+when creating retry filters of their own.
 
 The `Retries` module is configured with two parameters:
 
@@ -492,7 +558,16 @@ Since we have information about the availability of an endpoint in the balancer,
 a viable intersection to validate such changes. Balancers have a "probation" capability built-in
 behind a client parameter [#probation]_.
 
+Behavior when no nodes are available
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+When there are no nodes in the `com.twitter.finagle.Status.Open` state, the balancers
+must make a decision. One approach is to fail the request at this point. Instead,
+Finagle makes an optimistic decision that its view of the nodes may be out-of-date
+and picks a node it hopes has become available.
+
 :ref:`Related stats <loadbalancer_stats>`
+
+.. _client_circuit_breaking:
 
 Circuit Breaking
 ~~~~~~~~~~~~~~~~
@@ -561,45 +636,36 @@ The module is implemented by :src:`FailureAccrualFactory <com/twitter/finagle/se
 See :ref:`Failure Accrual Stats <failure_accrual_stats>` for stats exported from the
 ``Failure Accrual`` module.
 
-The ``FailureAccrualFactory`` uses configurable ``FailureAccrualPolicy`` [#experimental]_ to
-determine whether to mark an endpoint dead upon a request failure. At this point, there are two
-setups are available out of the box.
+The ``FailureAccrualFactory`` is configurable in terms of used policy to determine whether to mark
+an endpoint dead upon a request failure. At this point, there are two setups available out of
+the box.
 
 1. A policy based on the requests success rate meaning (i.e, an endpoint marked dead if its success rate
    goes bellow the given threshold)
 2. A policy based on the number of consecutive failures occurred in the endpoint (i.e., an endpoint marked
    dead if there are at least ``N`` consecutive failures occurred in this endpoint)
 
-The default setup for the `Failure Accrual` module is to use ``FailureAccrualPolicy`` based on the
+The default setup for the `Failure Accrual` module is to use a policy based on the
 number of consecutive failures (default is 5) accompanied by equal jittered backoff [#backoff]_ producing
 durations for which an endpoint is marked dead.
 
-Use the following code snippet to override the default configuration of the ``FailureAccrualFactory``.
-
-.. code-block:: scala
-
-  import com.twitter.finagle.Http
-  import com.twitter.finagle.service.exp.FailureAccrualPolicy
-
-  val policy: FailureAccrualPolicy = ???
-  val twitter = Http.client
-    .withSessionQualifier.failureAccrualPolicy(policy)
-    .newService("twitter.com")
-
-Use ``FailureAccrualPolicy.successRate`` to construct an instance of ``FailureAccrualPolicy`` based on
-requests success rate [#example]_.
+Use ``FailureAccrualFactory.Param`` [#experimental]_ to configure Failure Accrual` based on requests
+success rate [#example]_.
 
 .. code-block:: scala
 
   import com.twitter.conversions.time._
-  import com.twitter.finagle.service.Backoff
+  import com.twitter.finagle.Http
+  import com.twitter.finagle.service.{Backoff, FailureAccrualFactory}
   import com.twitter.finagle.service.exp.FailureAccrualPolicy
 
-  val policy: FailureAccrualPolicy = FailureAccrualPolicy.successRate(
-    requiredSuccessRate = 0.95,
-    window = 100,
-    markDeadFor = Backoff.const(30.seconds)
-  )
+  val twitter = Http.client
+    .configured(FailureAccrualFactory.Param(() => FailureAccrualPolicy.successRate(
+      requiredSuccessRate = 0.95,
+      window = 100,
+      markDeadFor = Backoff.const(10.seconds)
+    )))
+    .newService("twitter.com")
 
 The ``successRate`` factory method takes three arguments:
 
@@ -608,22 +674,25 @@ The ``successRate`` factory method takes three arguments:
 3. `markDeadFor` - the backoff policy (an instance of ``Stream[Duration]``) used to mark an endpoint
    dead for
 
-To construct an instance of ``FailureAccrualPolicy`` based on a number of consecutive failures, use the
-``consecutiveFailures`` factory method [#example]_.
+To configure `Failure Accrual` based on a number of consecutive failures [#experimental]_, use the
+following snippet [#example]_.
 
 .. code-block:: scala
 
   import com.twitter.conversions.time._
-  import com.twitter.finagle.service.Backoff
+  import com.twitter.finagle.Http
+  import com.twitter.finagle.service.{Backoff, FailureAccrualFactory}
   import com.twitter.finagle.service.exp.FailureAccrualPolicy
 
-  val policy: FailureAccrualPolicy =
-    FailureAccrualPolicy.consecutiveFailures(
-      consecutiveFailures = 10,
-      markDeadFor = Backoff.const(30.seconds)
-    )
 
-The ``consecutiveFailures`` factory method takes two arguments:
+  val twitter = Http.client
+    .configured(FailureAccrual.Param(() => FailureAccrualPolicy.consecutiveFailures(
+      numFailures = 10,
+      markDeadFor = Backoff.const(10.seconds)
+    )))
+    .newService("twitter.com")
+
+The ``consecutiveFailures`` method takes two arguments:
 
 1. `consecutiveFailures` - the number of failures after which an endpoint is marked dead
 2. `markDeadFor` - the backoff policy (an instance of ``Stream[Duration]``) used to mark an endpoint
@@ -723,120 +792,9 @@ and then slowly decays, based on the TTL.
 
 :ref:`Related stats <pool_stats>`
 
-Response Classification
------------------------
+.. _response_classification:
 
-To give Finagle visibility into application level success and failure
-developers can provide classification of responses by using
-:src:`response classifiers <com/twitter/finagle/service/package.scala>`.
-This gives Finagle the proper domain knowledge and improves the efficacy of
-:ref:`failure accrual <client_failure_accrual>` and more accurate
-:ref:`success rate stats <metrics_stats_filter>`.
-
-For HTTP clients, using ``HttpResponseClassifier.ServerErrorsAsFailures`` often works
-great as it classifies any HTTP 5xx response code as a failure. For Thrift/ThriftMux
-clients you may want to use ``ThriftResponseClassifier.ThriftExceptionsAsFailures``
-which classifies any deserialized Thrift Exception as a failure. For a large set of
-use cases these should suffice. Classifiers get wired up to your client in a
-straightforward manner, for example:
-
-.. code-block:: scala
-
-  import com.twitter.finagle.ThriftMux
-  import com.twitter.finagle.thrift.service.ThriftResponseClassifier
-
-  ThriftMux.client
-    ...
-    .withResponseClassifier(ThriftResponseClassifier.ThriftExceptionsAsFailures)
-
-If a classifier is not specified on a client or if a user's classifier isn't
-defined for a given request/response pair then ``ResponseClassifier.Default``
-is used. This gives us the simple classification rules of responses that are
-``Returns`` are successful and ``Throws`` are failures.
-
-Custom Classifiers
-~~~~~~~~~~~~~~~~~~
-
-Writing a custom classifier requires understanding of the few classes used. A
-``ResponseClassifier`` is a ``PartialFunction`` from ``ReqRep`` to
-``ResponseClass``.
-
-Let's work our way backwards through those, beginning with ``ResponseClass``.
-This can be either ``Successful`` or ``Failed`` and those values are
-self-explanatory. There are three constants which will cover the vast majority
-of usage: ``Success``, ``NonRetryableFailure`` and ``RetryableFailure``. While
-as of today there is no distinction made between retryable and non-retryable
-failures, it was a good opportunity to lay the groundwork for use in the future.
-
-A ``ReqRep`` is a request/response struct with a request of type ``Any`` and a
-response of type ``Try[Any]``. While all of this functionality is called
-response classification, you’ll note that classifiers make judgements on both a
-request and response.
-
-Creating a custom ``ResponseClassifier`` is fairly straightforward for HTTP
-as the ``ReqRep`` is an ``http.Request`` and ``Try[http.Response]`` pair.
-Here is an example that counts HTTP 503s as failures:
-
-.. code-block:: scala
-
-  import com.twitter.finagle.http
-  import com.twitter.finagle.service.{ReqRep, ResponseClass, ResponseClassifier}
-  import com.twitter.util.Return
-
-  val classifier: ResponseClassifier = {
-    case ReqRep(_, Return(r: http.Response)) if r.statusCode == 503 =>
-      ResponseClass.NonRetryableFailure
-  }
-
-Note that this ``PartialFunction`` isn't total which is ok due to Finagle
-always using user defined classifiers in combination with
-``ResponseClassifier.Default`` which will cover all cases.
-
-Thrift and ThriftMux Classifiers
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Thrift and ThriftMux classifiers require a bit more care as the request and
-response types are not as obvious. This is because there is only a single
-``Service`` from ``Array[Byte]`` to ``Array[Byte]`` for all the methods of an
-IDL's service. To make this workable, there is support in Scrooge and
-``Thrift/ThriftMux.newService`` and ``Thrift/ThriftMux.newClient`` code to
-deserialize the responses into the expected application types so that
-classifiers can be written in terms of the Scrooge generated request type,
-``$Service.$Method.Args``, and the method's response type. Given an IDL:
-
-.. code-block:: none
-
-  exception NotFoundException { 1: string reason }
-
-  service SocialGraph {
-    i32 follow(1: i64 follower, 2: i64 followee) throws (1: NotFoundException ex)
-  }
-
-One possible classifier would be:
-
-.. code-block:: scala
-
-  import com.twitter.finagle.service.{ReqRep, ResponseClass, ResponseClassifier}
-
-  val classifier: ResponseClassifier = {
-    // #1
-    case ReqRep(_, Throw(_: NotFoundException)) =>
-      ResponseClass.NonRetryableFailure
-
-    // #2
-    case ReqRep(_, Return(x: Int)) if x == 0 =>
-      ResponseClass.NonRetryableFailure
-
-    // #3
-    case ReqRep(SocialGraph.Follow.Args(a, b), _) if a <= 0 =>
-      ResponseClass.NonRetryableFailure
-  }
-
-If you examine that classifier you'll note a few things. First (#1), the
-deserialized ``NotFoundException`` can be treated as a failure. Next (#2), a
-"successful" response can be examined to enable services using status codes to
-classify errors. Lastly (#3), the request can be introspected to make the
-decision.
+.. include:: shared-modules/ResponseClassification.rst
 
 .. rubric:: Footnotes
 
@@ -860,8 +818,8 @@ decision.
 .. [#p2c] Michael Mitzenmacher. 2001. The Power of Two Choices in Randomized Load Balancing.
    IEEE Trans. Parallel Distrib. Syst. 12, 10 (October 2001), 1094-1104.
 
-.. [#p2c_bounds] The maximum load on any server is roughly bound by `ln(ln(n))` where n is
-   the number of requests.
+.. [#p2c_bounds] The maximum load variance between any two servers is bound by `ln(ln(n))`
+   where n is the number of servers in the cluster.
 
 .. [#p2c_jmh] Our micro benchmark exposes the stark differences:
 

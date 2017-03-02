@@ -1,16 +1,13 @@
 package com.twitter.finagle.memcached.integration
 
 import _root_.java.io.ByteArrayOutputStream
-import _root_.java.lang.{Boolean => JBoolean}
 import com.twitter.common.application.ShutdownRegistry.ShutdownRegistryImpl
 import com.twitter.common.zookeeper.testing.ZooKeeperTestServer
 import com.twitter.common.zookeeper.{ServerSets, ZooKeeperClient, ZooKeeperUtils}
 import com.twitter.finagle.Memcached
-import com.twitter.finagle.cacheresolver.CachePoolConfig
-import com.twitter.finagle.memcached.PartitionedClient
-import com.twitter.finagle.memcached.util.ChannelBufferUtils._
+import com.twitter.finagle.memcached.{CachePoolConfig, PartitionedClient}
 import com.twitter.finagle.zookeeper.ZookeeperServerSetCluster
-import com.twitter.io.{Buf, Charsets}
+import com.twitter.io.Buf
 import com.twitter.util.Await
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
@@ -94,14 +91,14 @@ class Finagle6APITest extends FunSuite with BeforeAndAfter {
       val count = 100
         (0 until count).foreach{
           n => {
-            client.set("foo"+n, Buf.Utf8("bar"+n))()
+            Await.result(client.set("foo"+n, Buf.Utf8("bar"+n)))
           }
         }
 
       (0 until count).foreach {
         n => {
           val c = client.clientOf("foo"+n)
-          val Buf.Utf8(res) = c.get("foo"+n)().get
+          val Buf.Utf8(res) = Await.result(c.get("foo"+n)).get
           assert(res == "bar"+n)
         }
       }
@@ -116,24 +113,24 @@ class Finagle6APITest extends FunSuite with BeforeAndAfter {
       // Wait for group to contain members
       Thread.sleep(5000)
 
-      client.delete("foo")()
-      assert(client.get("foo")() == None)
-      client.set("foo", Buf.Utf8("bar"))()
+      Await.result(client.delete("foo"))
+      assert(Await.result(client.get("foo")) == None)
+      Await.result(client.set("foo", Buf.Utf8("bar")))
 
-      val Buf.Utf8(res) = client.get("foo")().get
+      val Buf.Utf8(res) = Await.result(client.get("foo")).get
       assert(res == "bar")
 
       val count = 100
         (0 until count).foreach{
           n => {
-            client.set("foo"+n, Buf.Utf8("bar"+n))()
+            Await.result(client.set("foo"+n, Buf.Utf8("bar"+n)))
           }
         }
 
       (0 until count).foreach {
         n => {
           val c = client.clientOf("foo"+n)
-          val Buf.Utf8(res) = c.get("foo"+n)().get
+          val Buf.Utf8(res) = Await.result(c.get("foo"+n)).get
           assert(res == "bar"+n)
         }
       }

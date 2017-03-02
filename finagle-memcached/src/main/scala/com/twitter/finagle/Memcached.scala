@@ -4,67 +4,82 @@ import _root_.java.net.SocketAddress
 import com.twitter.concurrent.Broker
 import com.twitter.conversions.time._
 import com.twitter.finagle
-import com.twitter.finagle.cacheresolver.{CacheNode, CacheNodeGroup}
-import com.twitter.finagle.client.{DefaultPool, StackClient, StdStackClient, Transporter}
-import com.twitter.finagle.dispatch.{GenSerialClientDispatcher, SerialServerDispatcher, PipeliningDispatcher}
-import com.twitter.finagle.loadbalancer.{Balancers, ConcurrentLoadBalancerFactory, LoadBalancerFactory}
+import com.twitter.finagle.client.{ClientRegistry, DefaultPool, StackClient, StdStackClient, Transporter}
+import com.twitter.finagle.dispatch.{GenSerialClientDispatcher, PipeliningDispatcher, SerialServerDispatcher}
+import com.twitter.finagle.loadbalancer.{Balancers, LoadBalancerFactory}
 import com.twitter.finagle.memcached._
 import com.twitter.finagle.memcached.exp.LocalMemcached
-import com.twitter.finagle.memcached.protocol.text.{MemcachedClientPipelineFactory, MemcachedServerPipelineFactory}
+import com.twitter.finagle.memcached.loadbalancer.ConcurrentLoadBalancerFactory
+import com.twitter.finagle.memcached.protocol.text.client.ClientTransport
+import com.twitter.finagle.memcached.protocol.text.client.DecodingToResponse
+import com.twitter.finagle.memcached.protocol.text.CommandToEncoding
+import com.twitter.finagle.memcached.protocol.text.server.ServerTransport
+import com.twitter.finagle.memcached.protocol.text.transport.{Netty3ClientFramer, Netty3ServerFramer, Netty4ClientFramer, Netty4ServerFramer}
 import com.twitter.finagle.memcached.protocol.{Command, Response, RetrievalCommand, Values}
+import com.twitter.finagle.memcached.Toggles
 import com.twitter.finagle.netty3.{Netty3Listener, Netty3Transporter}
-import com.twitter.finagle.param.{Monitor => _, ResponseClassifier => _, ExceptionStatsHandler => _, Tracer => _, _}
+import com.twitter.finagle.netty4.{Netty4Listener, Netty4Transporter}
+import com.twitter.finagle.param.{ExceptionStatsHandler => _, Monitor => _, ResponseClassifier => _, Tracer => _, _}
 import com.twitter.finagle.pool.SingletonPool
+import com.twitter.finagle.server.ServerInfo
 import com.twitter.finagle.server.{Listener, StackServer, StdStackServer}
 import com.twitter.finagle.service._
 import com.twitter.finagle.service.exp.FailureAccrualPolicy
-import com.twitter.finagle.stats.{StatsReceiver, ExceptionStatsHandler}
+import com.twitter.finagle.stats.{ExceptionStatsHandler, StatsReceiver}
+import com.twitter.finagle.toggle.Toggle
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
+import com.twitter.finagle.util.DefaultTimer
 import com.twitter.hashing
 import com.twitter.io.Buf
-import com.twitter.util.{Closable, Duration, Future, Monitor}
+import com.twitter.util.registry.GlobalRegistry
+import com.twitter.util.{Closable, Duration, Monitor}
 import scala.collection.mutable
 
-/**
- * Defines a [[Tracer]] that understands the finagle-memcached request type.
- * This is installed as the `ClientTracingFilter` in the default stack.
- */
-private[finagle] object MemcachedTraceInitializer {
-  object Module extends Stack.Module1[param.Tracer, ServiceFactory[Command, Response]] {
-    val role = TraceInitializerFilter.role
-    val description = "Initialize traces for the client and record hits/misses"
-    def make(_tracer: param.Tracer, next: ServiceFactory[Command, Response]) = {
-      val param.Tracer(tracer) = _tracer
-      val filter = new Filter(tracer)
-      filter andThen next
+private[finagle] object MemcachedTracingFilter {
+
+  object Module extends Stack.Module1[param.Label, ServiceFactory[Command, Response]] {
+    val role = ClientTracingFilter.role
+    val description = "Add Memcached client specific annotations to the trace"
+
+    def make(_label: param.Label, next: ServiceFactory[Command, Response]) = {
+      val param.Label(label) = _label
+      val annotations = new AnnotatingTracingFilter[Command, Response](
+        label, Annotation.ClientSend(), Annotation.ClientRecv())
+      annotations andThen TracingFilter andThen next
     }
   }
 
-  class Filter(tracer: Tracer) extends SimpleFilter[Command, Response] {
-    def apply(command: Command, service: Service[Command, Response]): Future[Response] =
-      Trace.letTracerAndNextId(tracer) {
-        val response = service(command)
+  object TracingFilter extends SimpleFilter[Command, Response] {
+    def apply(command: Command, service: Service[Command, Response]) = {
+      val response = service(command)
+      if (Trace.isActivelyTracing) {
+        // Submitting rpc name here assumes there is no further tracing lower in the stack
         Trace.recordRpc(command.name)
         command match {
-          case command: RetrievalCommand if Trace.isActivelyTracing =>
-            response onSuccess {
+          case command: RetrievalCommand =>
+            response.onSuccess {
               case Values(vals) =>
                 val cmd = command.asInstanceOf[RetrievalCommand]
                 val misses = mutable.Set.empty[String]
-                cmd.keys foreach { case Buf.Utf8(key) => misses += key }
-                vals foreach { value =>
+                cmd.keys.foreach { case Buf.Utf8(key) => misses += key }
+                vals.foreach { value =>
                   val Buf.Utf8(key) = value.key
                   Trace.recordBinary(key, "Hit")
                   misses.remove(key)
                 }
-                misses foreach { Trace.recordBinary(_, "Miss") }
+                misses.foreach {
+                  Trace.recordBinary(_, "Miss")
+                }
               case _ =>
             }
           case _ =>
+            response
         }
+      } else {
         response
       }
+    }
   }
 }
 
@@ -79,7 +94,6 @@ private[finagle] object MemcachedTraceInitializer {
  * method on `Memcached.client`. Failing hosts can be ejected from the
  * hash ring if `withEjectFailedHost` is set to true. Note, the current
  * implementation only supports bound [[com.twitter.finagle.Name Names]].
- *
  * @define label
  *
  * Argument `label` is used to assign a label to this client.
@@ -110,6 +124,7 @@ trait MemcachedRichClient { self: finagle.Client[Command, Response] =>
  * Stack based Memcached client.
  *
  * For example, a default client can be built through:
+ *
  * @example {{{
  *   val client = Memcached.newRichClient(dest)
  * }}}
@@ -150,6 +165,46 @@ object Memcached extends finagle.Client[Command, Response]
       implicit val param = Stack.Param(KeyHasher(hashing.KeyHasher.KETAMA))
     }
 
+    /**
+     * Configure the [[Transporter]] and [[Listener]] implementation
+     * used by Memcached.
+     */
+    case class MemcachedImpl(
+        transporter: Stack.Params => SocketAddress => Transporter[Buf, Buf],
+        listener: Stack.Params => Listener[Buf, Buf]) {
+      def mk(): (MemcachedImpl, Stack.Param[MemcachedImpl]) =
+        (this, MemcachedImpl.param)
+    }
+
+    object MemcachedImpl {
+      /**
+       * A [[MemcachedImpl]] that uses netty3 as the underlying I/O multiplexer.
+       */
+      val Netty3 = MemcachedImpl(
+        params => Netty3Transporter[Buf, Buf](Netty3ClientFramer, _, params),
+        params => Netty3Listener[Buf, Buf](Netty3ServerFramer, params))
+
+      /**
+       * A [[MemcachedImpl]] that uses netty4 as the underlying I/O multiplexer.
+       *
+       * @note Important! This is experimental and not yet tested in production!
+       */
+      val Netty4 = MemcachedImpl(
+        params => Netty4Transporter.raw(Netty4ClientFramer, _, params),
+        params => Netty4Listener[Buf, Buf](Netty4ServerFramer, params))
+
+      private[this] val UseNetty4ToggleId: String =
+        "com.twitter.finagle.memcached.UseNetty4"
+
+      private[this] val netty4Toggle: Toggle[Int] = Toggles(UseNetty4ToggleId)
+      private[this] def useNetty4: Boolean = netty4Toggle(ServerInfo().id.hashCode)
+
+      implicit val param: Stack.Param[MemcachedImpl] = Stack.Param(
+        if (useNetty4) Netty4
+        else Netty3
+      )
+    }
+
     case class NumReps(reps: Int) {
       def mk(): (NumReps, Stack.Param[NumReps]) =
         (this, NumReps.param)
@@ -162,8 +217,24 @@ object Memcached extends finagle.Client[Command, Response]
 
   object Client {
 
+    private[Memcached] val ProtocolLibraryName = "memcached"
+
+    /**
+     * We use 10 consecutive errors as we have experience that per connection rps within a client
+     * is a lot lower than the overall rps generated by a service and memcached backends do not
+     * tend to show transient errors. Clients should backoff early and long enough to let a failing
+     * backend removed from the cache ring.
+     * per_conn_rps = total_rps / (number_of_clients * number_of_backends * number_of_conn_per_client)
+     */
     private[this] val defaultFailureAccrualPolicy = () => FailureAccrualPolicy.consecutiveFailures(
-      100, Backoff.const(1.second))
+      10, Backoff.const(30.seconds))
+
+    /**
+     * To prevent an ever growing pipeline which can cause increased memory pressure on the client,
+     * we set a limit to the number of pending requests allowed. Requests overflowing this limit
+     * will return a RejectedExecutionException.
+     */
+    private[this] val defaultPendingRequestLimit = Some(100)
 
     /**
      * Default stack parameters used for memcached client. We change the
@@ -174,7 +245,8 @@ object Memcached extends finagle.Client[Command, Response]
       FailureAccrualFactory.Param(defaultFailureAccrualPolicy) +
       FailFastFactory.FailFast(false) +
       LoadBalancerFactory.Param(Balancers.p2cPeakEwma()) +
-      finagle.param.ProtocolLibrary("memcached")
+      PendingRequestFilter.Param(limit = defaultPendingRequestLimit) +
+      finagle.param.ProtocolLibrary(ProtocolLibraryName)
 
     /**
      * A default client stack which supports the pipelined memcached client.
@@ -185,7 +257,7 @@ object Memcached extends finagle.Client[Command, Response]
     def newStack: Stack[ServiceFactory[Command, Response]] = StackClient.newStack
       .replace(LoadBalancerFactory.role, ConcurrentLoadBalancerFactory.module[Command, Response])
       .replace(DefaultPool.Role, SingletonPool.module[Command, Response])
-      .replace(ClientTracingFilter.role, MemcachedTraceInitializer.Module)
+      .replace(ClientTracingFilter.role, MemcachedTracingFilter.Module)
 
     /**
      * The memcached client should be using fixed hosts that do not change
@@ -196,11 +268,27 @@ object Memcached extends finagle.Client[Command, Response]
       s"${FixedInetResolver.scheme}!$hostName:$port"
   }
 
+  private[finagle] def registerClient(
+    label: String,
+    hasher: String,
+    isPipelining: Boolean
+  ): Unit = {
+    GlobalRegistry.get.put(
+      Seq(ClientRegistry.registryName, Client.ProtocolLibraryName, label, "is_pipelining"),
+      isPipelining.toString)
+    GlobalRegistry.get.put(
+      Seq(ClientRegistry.registryName, Client.ProtocolLibraryName, label, "key_hasher"),
+      hasher)
+  }
+
+  /**
+   * A memcached client with support for pipelined requests, consistent hashing,
+   * and per-node load-balancing.
+   */
   case class Client(
       stack: Stack[ServiceFactory[Command, Response]] = Client.newStack,
       params: Stack.Params = Client.defaultParams)
     extends StdStackClient[Command, Response, Client]
-    with WithConcurrentLoadBalancer[Client]
     with MemcachedRichClient {
 
     import Client.mkDestination
@@ -210,19 +298,23 @@ object Memcached extends finagle.Client[Command, Response]
       params: Stack.Params = this.params
     ): Client = copy(stack, params)
 
-    protected type In = Command
-    protected type Out = Response
+    protected type In = Buf
+    protected type Out = Buf
 
-    protected def newTransporter(): Transporter[In, Out] =
-      Netty3Transporter(MemcachedClientPipelineFactory, params)
+    protected def newTransporter(addr: SocketAddress): Transporter[In, Out] =
+      params[param.MemcachedImpl].transporter(params)(addr)
 
     protected def newDispatcher(transport: Transport[In, Out]): Service[Command, Response] =
       new PipeliningDispatcher(
-        transport,
-        params[finagle.param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
+        new ClientTransport[Command, Response](
+          new CommandToEncoding,
+          new DecodingToResponse,
+          transport),
+        params[finagle.param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope),
+        DefaultTimer.twitter
       )
 
-    def newTwemcacheClient(dest: Name, label: String) = {
+    def newTwemcacheClient(dest: Name, label: String): TwemcacheClient = {
       val _dest = if (LocalMemcached.enabled) {
         Resolver.eval(mkDestination("localhost", LocalMemcached.port))
       } else dest
@@ -231,12 +323,17 @@ object Memcached extends finagle.Client[Command, Response]
       // See KetamaPartitionedClient for more details.
       val va = _dest match {
         case Name.Bound(va) => va
-        case _ => throw new IllegalArgumentException("Memcached client only supports Bound Names")
+        case n =>
+          throw new IllegalArgumentException(s"Memcached client only supports Bound Names, was: $n")
       }
 
       val finagle.param.Stats(sr) = params[finagle.param.Stats]
       val param.KeyHasher(hasher) = params[param.KeyHasher]
       val param.NumReps(numReps) = params[param.NumReps]
+
+      val label0 = if (label == "") params[Label].label else label
+
+      registerClient(label0, hasher.toString, isPipelining = true)
 
       val healthBroker = new Broker[NodeHealth]
 
@@ -244,12 +341,11 @@ object Memcached extends finagle.Client[Command, Response]
         val key = KetamaClientKey.fromCacheNode(node)
         val stk = stack.replace(FailureAccrualFactory.role,
           KetamaFailureAccrualFactory.module[Command, Response](key, healthBroker))
-        withStack(stk).newService(mkDestination(node.host, node.port), label)
+        withStack(stk).newService(mkDestination(node.host, node.port), label0)
       }
 
-      val group = CacheNodeGroup(Group.fromVarAddr(va))
-      val scopedSr = sr.scope(label)
-      new KetamaPartitionedClient(group, newService, healthBroker, scopedSr, hasher, numReps)
+      val scopedSr = sr.scope(label0)
+      new KetamaPartitionedClient(va, newService, healthBroker, scopedSr, hasher, numReps)
         with TwemcachePartitionedClient
     }
 
@@ -280,14 +376,21 @@ object Memcached extends finagle.Client[Command, Response]
     def withNumReps(reps: Int): Client =
       configured(param.NumReps(reps))
 
-    // Java-friendly forwarders
-    // See https://issues.scala-lang.org/browse/SI-8905
-    override val withLoadBalancer: ConcurrentLoadBalancingParams[Client] =
-      new ConcurrentLoadBalancingParams(this)
+    /**
+     * Configures the number of concurrent `connections` a single endpoint has.
+     * The connections are load balanced over which allows the pipelined client to
+     * avoid head-of-line blocking and reduce its latency.
+     *
+     * We've empirically found that four is a good default for this, but it can be
+     * increased at the cost of additional connection overhead.
+     */
+    def connectionsPerEndpoint(connections: Int): Client =
+      configured(ConcurrentLoadBalancerFactory.Param(connections))
+
     override val withTransport: ClientTransportParams[Client] =
       new ClientTransportParams(this)
-    override val withSession: SessionParams[Client] =
-      new SessionParams(this)
+    override val withSession: ClientSessionParams[Client] =
+      new ClientSessionParams(this)
     override val withAdmissionControl: ClientAdmissionControlParams[Client] =
       new ClientAdmissionControlParams(this)
     override val withSessionQualifier: SessionQualificationParams[Client] =
@@ -327,6 +430,9 @@ object Memcached extends finagle.Client[Command, Response]
       finagle.param.ProtocolLibrary("memcached")
   }
 
+  /**
+   * A Memcached server that should be used only for testing
+   */
   case class Server(
       stack: Stack[ServiceFactory[Command, Response]] = StackServer.newStack,
       params: Stack.Params = Server.defaultParams)
@@ -337,22 +443,23 @@ object Memcached extends finagle.Client[Command, Response]
       params: Stack.Params = this.params
     ): Server = copy(stack, params)
 
-    protected type In = Response
-    protected type Out = Command
+    protected type In = Buf
+    protected type Out = Buf
 
-    protected def newListener(): Listener[In, Out] = {
-      Netty3Listener("memcached", MemcachedServerPipelineFactory)
-    }
+    protected def newListener(): Listener[In, Out] =
+      params[param.MemcachedImpl].listener(params)
 
     protected def newDispatcher(
       transport: Transport[In, Out],
       service: Service[Command, Response]
-    ): Closable = new SerialServerDispatcher(transport, service)
+    ): Closable = new SerialServerDispatcher(new ServerTransport(transport), service)
 
     // Java-friendly forwarders
     //See https://issues.scala-lang.org/browse/SI-8905
     override val withAdmissionControl: ServerAdmissionControlParams[Server] =
       new ServerAdmissionControlParams(this)
+    override val withSession: SessionParams[Server] =
+      new SessionParams(this)
     override val withTransport: ServerTransportParams[Server] =
       new ServerTransportParams(this)
 

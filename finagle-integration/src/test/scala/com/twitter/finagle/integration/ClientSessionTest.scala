@@ -2,11 +2,12 @@ package com.twitter.finagle.integration
 
 import com.twitter.concurrent.AsyncQueue
 import com.twitter.finagle._
-import com.twitter.finagle.exp._
+import com.twitter.finagle.http.{Request, Response}
 import com.twitter.finagle.http.codec.HttpClientDispatcher
-import com.twitter.finagle.exp.mysql
+import com.twitter.finagle.http.exp.IdentityStreamTransport
 import com.twitter.finagle.stats.NullStatsReceiver
 import com.twitter.finagle.transport.{QueueTransport, Transport}
+import com.twitter.io.Buf
 import com.twitter.util._
 import com.twitter.util.TimeConversions._
 import org.junit.runner.RunWith
@@ -62,8 +63,11 @@ class ClientSessionTest extends FunSuite with MockitoSugar {
     "http-transport",
     { tr: Transport[Any, Any] =>
       val manager = mock[http.codec.ConnectionManager]
+      val closeP = new Promise[Unit]
       when(manager.shouldClose).thenReturn(false)
-      val wrappedT = new http.HttpTransport(tr, manager)
+      when(manager.onClose).thenReturn(closeP)
+      val wrappedT = new http.HttpTransport(
+        new IdentityStreamTransport(Transport.cast[Request, Response](tr)), manager)
       () => wrappedT.status
     }
   )
@@ -71,18 +75,23 @@ class ClientSessionTest extends FunSuite with MockitoSugar {
   testSessionStatus(
     "http-dispatcher",
     { tr: Transport[Any, Any] =>
-      val dispatcher = new HttpClientDispatcher(tr)
+      val dispatcher = new HttpClientDispatcher(
+        new IdentityStreamTransport(Transport.cast[Request, Response](tr)),
+        NullStatsReceiver
+      )
       () => dispatcher.status
     }
   )
 
   class MyClient extends com.twitter.finagle.Memcached.Client {
-    def newDisp(transport: Transport[In, Out]): Service[In, Out] = super.newDispatcher(transport)
+    def newDisp(transport: Transport[Buf, Buf]):
+      Service[memcached.protocol.Command, memcached.protocol.Response] =
+      super.newDispatcher(transport)
   }
 
   testSessionStatus(
     "memcached-dispatcher",
-    { tr: Transport[memcached.protocol.Command, memcached.protocol.Response] =>
+    { tr: Transport[Buf, Buf] =>
       val cl: MyClient = new MyClient
       val svc = cl.newDisp(tr)
       () => svc.status

@@ -1,10 +1,10 @@
 # Finagle
 
 [![Build status](https://travis-ci.org/twitter/finagle.svg?branch=develop)](https://travis-ci.org/twitter/finagle)
-[![Coverage status](https://img.shields.io/coveralls/twitter/finagle/develop.svg)](https://coveralls.io/r/twitter/finagle?branch=develop)
+[![Codecov branch](https://img.shields.io/codecov/c/github/twitter/finagle/develop.svg)](http://codecov.io/github/twitter/finagle?branch=develop)
 [![Project status](https://img.shields.io/badge/status-active-brightgreen.svg)](#status)
 [![Gitter](https://img.shields.io/badge/gitter-join%20chat-green.svg)](https://gitter.im/twitter/finagle?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-[![Maven Central](https://img.shields.io/maven-central/v/com.twitter/finagle_2.11.svg)](https://maven-badges.herokuapp.com/maven-central/com.twitter/finagle_2.11)
+[![Maven Central](https://img.shields.io/maven-central/v/com.twitter/finagle_2.12.svg)](https://maven-badges.herokuapp.com/maven-central/com.twitter/finagle_2.12)
 
 ## Status
 
@@ -13,12 +13,19 @@ and is being actively developed and maintained.
 
 ![Finagle logo](https://raw.github.com/twitter/finagle/master/doc/src/sphinx/_static/logo_small.png)
 
+## Releases
+
+[Releases](https://maven-badges.herokuapp.com/maven-central/com.twitter/finagle_2.12)
+are done on an approximately monthly schedule. While [semver](http://semver.org/)
+is not followed, the [changelogs](CHANGES) are detailed and include sections on
+public API breaks and changes in runtime behavior.
+
 ## Getting involved
 
 * Website: https://twitter.github.io/finagle/
 * Source: https://github.com/twitter/finagle/
 * Mailing List: [finaglers@googlegroups.com](https://groups.google.com/forum/#!forum/finaglers)
-* IRC: `#finagle` on Freenode
+* Chat: https://gitter.im/twitter/finagle
 
 Finagle is an extensible RPC system for the JVM, used to construct
 high-concurrency servers. Finagle implements uniform client and server APIs for

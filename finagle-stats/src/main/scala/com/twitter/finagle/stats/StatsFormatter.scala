@@ -1,8 +1,7 @@
 package com.twitter.finagle.stats
 
 import com.twitter.app.GlobalFlag
-import scala.collection.Map
-import scala.collection.mutable
+import scala.collection.{Map, mutable}
 import scala.util.matching.Regex
 
 object format extends GlobalFlag[String](
@@ -15,6 +14,17 @@ object format extends GlobalFlag[String](
 }
 
 /**
+ * If a histogram has no data collected (its count is 0), it can be
+ * beneficial to not export all the histogram details as there will
+ * be no interesting data there. When this flag is set to `false`,
+ * only the `count=0` is exported. When `true`, all of the details
+ * will be exported.
+ */
+object includeEmptyHistograms extends GlobalFlag[Boolean](
+    false,
+    "Include full histogram details when there are no data points")
+
+/**
  * Allows for customization of how stat names get formatted.
  */
 private[stats] sealed trait StatsFormatter {
@@ -24,16 +34,20 @@ private[stats] sealed trait StatsFormatter {
     results ++= values.gauges
     results ++= values.counters
 
+    val includeEmpty = includeEmptyHistograms()
     values.histograms.foreach { case (name, snapshot) =>
-      results += histoName(name, "count") -> snapshot.count
-      results += histoName(name, "sum") -> snapshot.sum
-      results += histoName(name, labelAverage) -> snapshot.avg
-      results += histoName(name, labelMin) -> snapshot.min
-      results += histoName(name, labelMax) -> snapshot.max
+      val count = snapshot.count
+      results += histoName(name, "count") -> count
+      if (count > 0 || includeEmpty) {
+        results += histoName(name, "sum") -> snapshot.sum
+        results += histoName(name, labelAverage) -> snapshot.avg
+        results += histoName(name, labelMin) -> snapshot.min
+        results += histoName(name, labelMax) -> snapshot.max
 
-      for (p <- snapshot.percentiles) {
-        val percentileName = histoName(name, labelPercentile(p.getQuantile))
-        results += percentileName -> p.getValue
+        for (p <- snapshot.percentiles) {
+          val percentileName = histoName(name, labelPercentile(p.getQuantile))
+          results += percentileName -> p.getValue
+        }
       }
     }
     results
@@ -138,8 +152,8 @@ private[stats] object StatsFormatter {
 
     private[this] def inMegabytes(l: Number): Number = l.longValue() / 1048576L
     private[this] def inSeconds(l: Number): Number = l.longValue() / 1000L
-    private[this] val gcCycles: Regex = "^jvm_mem_(.*)_cycles$".r
-    private[this] val gcMsec: Regex = "^jvm_mem_(.*)_msec$".r
+    private[this] val gcCycles: Regex = "^jvm_gc_(.*)_cycles$".r
+    private[this] val gcMsec: Regex = "^jvm_gc_(.*)_msec$".r
 
     override def apply(values: SampledValues): Map[String, Number] = {
       val original = super.apply(values)

@@ -2,20 +2,18 @@ package com.twitter.finagle.client
 
 import com.twitter.finagle._
 import com.twitter.finagle.Namer.AddrWeightKey
-import com.twitter.finagle.param.Label
 import com.twitter.util._
-import java.net.{InetSocketAddress, SocketAddress}
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
 
 @RunWith(classOf[JUnitRunner])
-class EndpointRecorderTest extends FunSuite {
+final class EndpointRecorderTest extends FunSuite {
 
   val name = "fooClient"
   val path = "/foo"
 
-  val addrs: Set[SocketAddress] = Set(new InetSocketAddress(8080))
+  val addrs: Set[Address] = Set(Address(8080))
 
   val bound = Addr.Bound(addrs.toSet, Addr.Metadata(AddrWeightKey -> 2.0))
 

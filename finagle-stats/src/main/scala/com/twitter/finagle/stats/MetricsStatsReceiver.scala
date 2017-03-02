@@ -1,16 +1,17 @@
 package com.twitter.finagle.stats
 
 import com.twitter.app.GlobalFlag
-import com.twitter.common.metrics.{HistogramInterface, AbstractGauge, Metrics}
-import com.twitter.finagle.http.HttpMuxHandler
+import com.twitter.common.metrics.{AbstractGauge, HistogramInterface, Metrics}
+import com.twitter.finagle.http.{HttpMuxHandler, Route, RouteIndex}
 import com.twitter.finagle.tracing.Trace
 import com.twitter.io.Buf
-import com.twitter.jsr166e.LongAdder
 import com.twitter.logging.{Level, Logger}
 import com.twitter.util.events.{Event, Sink}
-import com.twitter.util.lint.{Issue, Category, Rule, GlobalRules}
-import com.twitter.util.{Time, Throw, Try}
+import com.twitter.util.lint.{Category, GlobalRules, Issue, Rule}
+import com.twitter.util.{Throw, Time, Try}
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.LongAdder
+import scala.collection.JavaConverters._
 
 private object Json {
   import com.fasterxml.jackson.annotation.JsonInclude
@@ -20,7 +21,7 @@ private object Json {
   import com.fasterxml.jackson.module.scala.DefaultScalaModule
   import java.lang.reflect.{Type, ParameterizedType}
 
-  @JsonInclude(JsonInclude.Include.NON_NULL)
+  @JsonInclude(JsonInclude.Include.NON_ABSENT)
   case class Envelope[A](
       id: String,
       when: Long,
@@ -171,7 +172,8 @@ class MetricsStatsReceiver(
   val registry: Metrics,
   sink: Sink,
   histogramFactory: String => HistogramInterface
-) extends StatsReceiverWithCumulativeGauges {
+) extends WithHistogramDetails
+  with StatsReceiverWithCumulativeGauges {
   import MetricsStatsReceiver._
 
   def this(registry: Metrics, sink: Sink) = this(registry, sink, MetricsStatsReceiver.defaultFactory)
@@ -183,6 +185,9 @@ class MetricsStatsReceiver(
   // Use for backward compatibility with ostrich caching behavior
   private[this] val counters = new ConcurrentHashMap[Seq[String], Counter]
   private[this] val stats = new ConcurrentHashMap[Seq[String], Stat]
+
+  // Used to store underlying histogram counts
+  private[this] val histoDetails = new ConcurrentHashMap[String, HistogramDetail]
 
   private[this] val log = Logger.get()
 
@@ -286,6 +291,14 @@ class MetricsStatsReceiver(
               }
             }
           }
+          // Provide read-only access to underlying histogram through histoDetails
+          val statName = format(names)
+          histogram match {
+            case histo: MetricsBucketedHistogram => 
+              histoDetails.put(statName, histo.histogramDetail)
+            case _ => 
+              log.debug(s"$statName's histogram implementation doesn't support details")
+          }
         }
         stats.put(names, stat)
       }
@@ -312,6 +325,9 @@ class MetricsStatsReceiver(
   }
 
   private[this] def format(names: Seq[String]) = names.mkString(separator)
+
+  def histogramDetails: Map[String, HistogramDetail] = histoDetails.asScala.toMap
+
 }
 
 class MetricsExporter(val registry: Metrics)
@@ -321,4 +337,11 @@ class MetricsExporter(val registry: Metrics)
 {
   def this() = this(MetricsStatsReceiver.defaultRegistry)
   val pattern = "/admin/metrics.json"
+  override def route: Route = Route(
+    pattern = this.pattern,
+    handler = this,
+    index = Some(RouteIndex(
+      alias = "Metrics",
+      group = "Metrics",
+      path = Some("/admin/metrics.json?pretty=true"))))
 }

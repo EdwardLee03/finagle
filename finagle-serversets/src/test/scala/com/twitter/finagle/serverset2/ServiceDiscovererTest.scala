@@ -46,7 +46,7 @@ class ServiceDiscovererTest extends FunSuite with MockitoSugar with Eventually w
     serviceInstance.setShard(1)
     serviceInstance.setStatus(thrift.Status.ALIVE)
     serviceInstance.setServiceEndpoint(new thrift.Endpoint(s"$id.0.0.12", 32123))
-    ByteArray(ServerSets.serializeServiceInstance(serviceInstance, jsonCodec))
+    ByteArray.Owned(ServerSets.serializeServiceInstance(serviceInstance, jsonCodec))
   }
 
   test("ServiceDiscoverer.zipWithWeights") {
@@ -175,7 +175,10 @@ class ServiceDiscovererTest extends FunSuite with MockitoSugar with Eventually w
         watchedZk, NullStatsReceiver)), NullStatsReceiver, timer)
 
       val currentValue = new AtomicReference[Activity.State[Seq[(Entry, Double)]]]
-      sd("/foo/bar").states.filter(_ != Activity.Pending).register(Witness(currentValue))
+
+      // Test will become flaky if we don't capture this as the Closeable will be occasionally
+      // closed by the CollectCloseables thread
+      val holdRef = sd("/foo/bar").states.filter(_ != Activity.Pending).register(Witness(currentValue))
       val cache = sd.cache
 
       val ew@ExistsWatch("/foo/bar") = watchedZk.value.opq(0)

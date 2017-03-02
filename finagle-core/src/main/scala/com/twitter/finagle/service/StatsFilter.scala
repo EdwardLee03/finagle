@@ -2,11 +2,10 @@ package com.twitter.finagle.service
 
 import com.twitter.finagle.Filter.TypeAgnostic
 import com.twitter.finagle._
-import com.twitter.finagle.stats.{
-  MultiCategorizingExceptionStatsHandler, ExceptionStatsHandler, StatsReceiver}
-import com.twitter.jsr166e.LongAdder
-import com.twitter.util.{Try, Future, Stopwatch, Throw}
+import com.twitter.finagle.stats.{ExceptionStatsHandler, MultiCategorizingExceptionStatsHandler, StatsReceiver}
+import com.twitter.util.{Future, Stopwatch, Throw, Try}
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.LongAdder
 
 object StatsFilter {
   val role = Stack.Role("RequestStats")
@@ -56,7 +55,13 @@ object StatsFilter {
   /** Basic categorizer with all exceptions under 'failures'. */
   val DefaultExceptions = new MultiCategorizingExceptionStatsHandler(
     mkFlags = Failure.flagsOf,
-    mkSource = SourcedException.unapply)
+    mkSource = SourcedException.unapply) {
+
+    override def toString: String = "DefaultCategorizer"
+  }
+
+  private val SyntheticException =
+    new ResponseClassificationSyntheticException()
 
   def typeAgnostic(
     statsReceiver: StatsReceiver,
@@ -95,6 +100,7 @@ class StatsFilter[Req, Rep](
     timeUnit: TimeUnit)
   extends SimpleFilter[Req, Rep]
 {
+  import StatsFilter.SyntheticException
 
   def this(
     statsReceiver: StatsReceiver,
@@ -121,7 +127,6 @@ class StatsFilter[Req, Rep](
   private[this] val dispatchCount = statsReceiver.counter("requests")
   private[this] val successCount = statsReceiver.counter("success")
   private[this] val latencyStat = statsReceiver.stat(s"request_latency_$latencyStatSuffix")
-  private[this] val loadGauge = statsReceiver.addGauge("load") { outstandingRequestCount.sum() }
   private[this] val outstandingRequestCountGauge =
     statsReceiver.addGauge("pending") { outstandingRequestCount.sum() }
 
@@ -153,14 +158,15 @@ class StatsFilter[Req, Rep](
         ) match {
           case ResponseClass.Failed(_) =>
             latencyStat.add(elapsed().inUnit(timeUnit))
+            response match {
+              case Throw(e) =>
+                exceptionStatsHandler.record(statsReceiver, e)
+              case _ =>
+                exceptionStatsHandler.record(statsReceiver, SyntheticException)
+            }
           case ResponseClass.Successful(_) =>
             successCount.incr()
             latencyStat.add(elapsed().inUnit(timeUnit))
-        }
-
-        response match {
-          case Throw(e) => exceptionStatsHandler.record(statsReceiver, e)
-          case _ =>
         }
       }
     }
@@ -177,7 +183,7 @@ private[finagle] object StatsServiceFactory {
     new Stack.Module1[param.Stats, ServiceFactory[Req, Rep]] {
       val role = StatsServiceFactory.role
       val description = "Report connection statistics"
-      def make(_stats: param.Stats, next: ServiceFactory[Req, Rep]) = {
+      def make(_stats: param.Stats, next: ServiceFactory[Req, Rep]): ServiceFactory[Req, Rep] = {
         val param.Stats(statsReceiver) = _stats
         if (statsReceiver.isNull) next
         else new StatsServiceFactory(next, statsReceiver)

@@ -1,18 +1,19 @@
 package com.twitter.finagle.loadbalancer
 
 import com.twitter.finagle._
-import com.twitter.finagle.stats.{InMemoryStatsReceiver, StatsReceiver, NullStatsReceiver}
+import com.twitter.finagle.stats.{InMemoryStatsReceiver, StatsReceiver}
 import com.twitter.util.{Future, Time}
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.runner.RunWith
 import org.scalacheck.Gen
 import org.scalatest.FunSuite
+import org.scalatest.concurrent.{Conductors, IntegrationPatience}
 import org.scalatest.junit.JUnitRunner
-import org.scalatest.concurrent.{IntegrationPatience, Conductors}
 import org.scalatest.prop.GeneratorDrivenPropertyChecks
+import scala.language.reflectiveCalls
 
 @RunWith(classOf[JUnitRunner])
-private class BalancerTest extends FunSuite
+class BalancerTest extends FunSuite
   with Conductors
   with IntegrationPatience
   with GeneratorDrivenPropertyChecks {
@@ -36,10 +37,10 @@ private class BalancerTest extends FunSuite
 
     def rebuildDistributor() {}
 
-    case class Distributor(vector: Vector[Node], gen: Int = 1) extends DistributorT {
+    case class Distributor(vec: Vector[Node], gen: Int = 1)
+      extends DistributorT[Node](vec) {
       type This = Distributor
       def pick(): Node = vector.head
-      def needsRebuild = false
       def rebuild(): This = {
         rebuildDistributor()
         copy(gen=gen+1)
@@ -48,9 +49,10 @@ private class BalancerTest extends FunSuite
         rebuildDistributor()
         copy(vector, gen=gen+1)
       }
+      def needsRebuild: Boolean = false
     }
 
-    class Node(val factory: ServiceFactory[Unit, Unit]) extends NodeT {
+    class Node(val factory: ServiceFactory[Unit, Unit]) extends NodeT[Unit, Unit] {
       type This = Node
       def load: Double = ???
       def pending: Int = ???

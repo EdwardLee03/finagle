@@ -50,17 +50,29 @@ User's guide
    Configuration
    Servers
    Clients
+   Contexts
    Names
    Protocols
-   Extending
    Metrics
+   UnsuccessfulResponses
    FAQ
+   Glossary
+
+Developer's Guide
+-----------------
+
+.. toctree::
+   :maxdepth: 1
+
+   developers/Extending
+   developers/Futures
+   developers/SignalingFailure
 
 Notes
 -----
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
 
    changelog
    license

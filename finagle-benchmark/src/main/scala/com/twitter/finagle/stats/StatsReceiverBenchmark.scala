@@ -1,7 +1,7 @@
 package com.twitter.finagle.stats
 
 import com.twitter.common.metrics.{Histogram, Metrics}
-import com.twitter.common.stats.{Stats, Stat => CStat}
+import com.twitter.common.stats.{Stats => CStats, Stat => CStat}
 import com.twitter.finagle.benchmark.StdBenchAnnotations
 import com.twitter.ostrich.stats.StatsSummary
 import com.twitter.util.events.Sink
@@ -9,7 +9,7 @@ import java.util
 import org.openjdk.jmh.annotations._
 import scala.util.Random
 
-// ./sbt 'project finagle-benchmark' 'run .*StatsReceiverBenchmark.*'
+// ./sbt 'project finagle-benchmark' 'jmh:run StatsReceiverBenchmark'
 @Threads(3)
 class StatsReceiverBenchmark extends StdBenchAnnotations {
   import StatsReceiverBenchmark._
@@ -138,7 +138,7 @@ object StatsReceiverBenchmark {
     def ostrichGet(): StatsSummary = ostrich.repr.get()
     def metricsGet(): util.Map[String, Number] = metrics.registry.sample()
     def metricsBucketedGet(): util.Map[String, Number] = metricsBucketed.registry.sample()
-    def statsGet(): java.lang.Iterable[CStat[_]] = Stats.getVariables()
+    def statsGet(): java.lang.Iterable[CStat[_]] = CStats.getVariables()
 
     @Setup(Level.Trial)
     def setup(): Unit = {
@@ -158,7 +158,7 @@ object StatsReceiverBenchmark {
     @TearDown(Level.Trial)
     def teardown(): Unit = {
       ostrich.repr.clearAll()
-      Stats.flush()
+      CStats.flush()
     }
   }
 }

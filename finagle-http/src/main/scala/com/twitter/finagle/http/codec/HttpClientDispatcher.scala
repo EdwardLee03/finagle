@@ -1,101 +1,95 @@
 package com.twitter.finagle.http.codec
 
-import com.twitter.finagle.{Dtab, Failure}
 import com.twitter.finagle.dispatch.GenSerialClientDispatcher
-import com.twitter.finagle.http.{Fields, ReaderUtils, Request, Response}
+import com.twitter.finagle.http.{Fields, Request, Response}
+import com.twitter.finagle.http.exp.{Multi, StreamTransport}
 import com.twitter.finagle.http.filter.HttpNackFilter
-import com.twitter.finagle.http.netty.Bijections._
-import com.twitter.finagle.netty3.ChannelBufferBuf
-import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
-import com.twitter.finagle.transport.Transport
-import com.twitter.io.BufReader
+import com.twitter.finagle.stats.StatsReceiver
+import com.twitter.io.Reader
 import com.twitter.logging.Logger
 import com.twitter.util.{Future, Promise, Return, Throw}
-import org.jboss.netty.handler.codec.http.{HttpRequest, HttpResponse}
 
 private[http] object HttpClientDispatcher {
-  val NackFailure = Failure.rejected("The request was nacked by the server")
+
   private val log = Logger(getClass.getName)
+
+  private def swallowNackBody(response: Response): Future[Unit] = {
+    // It's not guaranteed that the body of a nack response will be fully buffered even though
+    // it is small and will have a content-length header: if the client is set to stream and
+    // the message happens to hit the buffer in a way that separates the response prelude and
+    // the body netty will send it as chunked anyway. Therefore, we need to manually discard
+    // it in such situations.
+    if (response.isChunked) {
+      def swallowBody(reader: Reader, maxRead: Int): Future[Unit] = {
+        // We add 1 to `readMax` in order to detect large responses earlier
+        // and avoid falling into an infinite loop of `read(0)` calls.
+        reader.read(maxRead + 1).flatMap {
+          case Some(msg) if msg.length <= maxRead =>
+            swallowBody(reader, maxRead - msg.length)
+
+          case Some(_) =>
+            val msg = "Received an excessively large nack response body."
+            val ex = new Exception(msg)
+            log.warning(ex, msg)
+            Future.exception(ex)
+
+          case None => Future.Done
+        }
+      }
+
+      // We don't want to try swallowing an infinite sized message body so we bound it
+      // to 1 KB, which should be more than enough as the message body is intended to be
+      // a one liner saying that the response is a nack response. If the message body is
+      // larger than 1 KB, we abort and log a warning.
+      swallowBody(response.reader, 1024)
+        .onFailure(_ => response.reader.discard())
+    } else {
+      Future.Done
+    }
+  }
 }
 
 /**
  * Client dispatcher for HTTP.
  *
- * The dispatcher modifies each request with Dtab encoding from Dtab.local
- * and streams chunked responses via `Reader`.  If the request already contains
- * Dtab headers they will be stripped and an error will be logged.
- *
  * @param statsReceiver typically scoped to `clientName/dispatcher`
  */
-class HttpClientDispatcher(
-    trans: Transport[Any, Any],
+private[finagle] class HttpClientDispatcher(
+    trans: StreamTransport[Request, Response],
     statsReceiver: StatsReceiver)
-  extends GenSerialClientDispatcher[Request, Response, Any, Any](
+  extends GenSerialClientDispatcher[Request, Response, Request, Multi[Response]](
     trans,
     statsReceiver) {
 
-  import GenSerialClientDispatcher.wrapWriteException
   import HttpClientDispatcher._
-  import ReaderUtils.{readChunk, streamChunks}
 
-  def this(trans: Transport[Any, Any]) =
-    this(trans, NullStatsReceiver)
-
-  // BUG: if there are multiple requests queued, this will close a connection
-  // with pending dispatches.  That is the right thing to do, but they should be
-  // re-queued. (Currently, wrapped in a WriteException, but in the future we
-  // should probably introduce an exception to indicate re-queueing -- such
-  // "errors" shouldn't be counted against the retry budget.)
   protected def dispatch(req: Request, p: Promise[Response]): Future[Unit] = {
-    val dtabHeaders = HttpDtab.strip(req)
-    if (dtabHeaders.nonEmpty) {
-      // Log an error immediately if we find any Dtab headers already in the request and report them
-      val headersString = dtabHeaders.map({case (k, v) => s"[$k: $v]"}).mkString(", ")
-      log.error(s"discarding manually set dtab headers in request: $headersString\n" +
-        s"set Dtab.local instead to send Dtab information.")
-    }
-
-    // It's kind of nasty to modify the request inline like this, but it's
-    // in-line with what we already do in finagle-http. For example:
-    // the body buf gets read without slicing.
-    HttpDtab.write(Dtab.local, req)
-
     if (!req.isChunked && !req.headerMap.contains(Fields.ContentLength)) {
-      val len = req.getContent().readableBytes
+      val len = req.content.length
       // Only set the content length if we are sure there is content. This
       // behavior complies with the specification that user agents should not
       // set the content length header for messages without a payload body.
       if (len > 0) req.headerMap.set(Fields.ContentLength, len.toString)
     }
 
-    trans.write(from[Request, HttpRequest](req)).rescue(wrapWriteException).before {
-      // Do these concurrently:
-      Future.join(
-        // 1. Drain the Request body into the Transport.
-        if (req.isChunked) streamChunks(trans, req.reader)
-        else Future.Done,
-        // 2. Drain the Transport into Response body.
-        trans.read() flatMap {
-          case res: HttpResponse if HttpNackFilter.isNack(res) =>
-            p.updateIfEmpty(Throw(NackFailure))
-            Future.Done
+    // wait on these concurrently:
+    Future.join(Seq(
+      trans.write(req),
+      // Drain the Transport into Response body.
+      trans.read().flatMap {
+        case Multi(res, readFinished) if HttpNackFilter.isRetryableNack(res) =>
+          p.updateIfEmpty(Throw(HttpNackFilter.RetryableNackFailure))
+          swallowNackBody(res).before(readFinished)
 
-          case res: HttpResponse if !res.isChunked =>
-            val response = Response(res, BufReader(ChannelBufferBuf.Owned(res.getContent)))
-            p.updateIfEmpty(Return(response))
-            Future.Done
+        case Multi(res, readFinished) if HttpNackFilter.isNonRetryableNack(res) =>
+          p.updateIfEmpty(Throw(HttpNackFilter.NonRetryableNackFailure))
+          swallowNackBody(res).before(readFinished)
 
-          case res: HttpResponse =>
-            val coll = Transport.collate(trans, readChunk)
-            p.updateIfEmpty(Return(Response(res, coll)))
-            coll
-
-          case invalid =>
-            // We rely on the base class to satisfy p.
-            Future.exception(new IllegalArgumentException(s"invalid message '$invalid'"))
-        }
-      ).unit
-    } onFailure { _ =>
+        case Multi(res, readFinished) =>
+          p.updateIfEmpty(Return(res))
+          readFinished
+      } // we don't need to satisfy p when we fail because GenSerialClientDispatcher does already
+    )).onFailure { _ =>
       // This Future represents the totality of the exchange;
       // thus failure represents *any* failure that can happen
       // during the exchange.

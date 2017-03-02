@@ -6,14 +6,15 @@ import com.twitter.finagle.service._
 import com.twitter.finagle.thrift.DeserializeCtx
 import com.twitter.finagle.thrift.service.ThriftResponseClassifier
 import com.twitter.io.Buf
-import com.twitter.util.{NonFatal, Return, Try}
+import com.twitter.util.{Return, Try}
+import scala.util.control.NonFatal
 
 /**
- * [[ResponseClassifier ResponseClassifiers]] for use with `finagle-thriftmux`
+ * `ResponseClassifiers` for use with `finagle-thriftmux`
  * request/responses.
  *
  * Thrift (and ThriftMux) services are a bit unusual in that
- * there is only a single [[com.twitter.finagle.Service]] from `Array[Byte]`
+ * there is only a single `com.twitter.finagle.Service` from `Array[Byte]`
  * to `Array[Byte]` for all the methods of an IDL's service.
  *
  * ThriftMux classifiers should be written in terms
@@ -54,7 +55,7 @@ object ThriftMuxResponseClassifier {
 
   /**
    * Categorizes responses where the '''deserialized''' response is a
-   * Thrift Exception as a [[ResponseClass.NonRetryableFailure]].
+   * Thrift Exception as a `ResponseClass.NonRetryableFailure`.
    */
   val ThriftExceptionsAsFailures: ResponseClassifier =
     ThriftResponseClassifier.ThriftExceptionsAsFailures
@@ -80,8 +81,7 @@ object ThriftMuxResponseClassifier {
    *
    * @note any exceptions thrown during deserialization will be ignored
    * if `apply` is guarded properly with `isDefinedAt`.
-   *
-   * @see [[com.twitter.finagle.ThriftMux.newClient newClient and newService]]
+    * @see [[com.twitter.finagle.ThriftMux.newClient newClient and newService]]
    * which will automatically apply these transformations to a [[ResponseClassifier]].
    */
   private[finagle] def usingDeserializeCtx(
@@ -104,18 +104,26 @@ object ThriftMuxResponseClassifier {
         return false
 
       reqRep.response match {
+        // we use the deserializer only if its a mux Response
         case Return(rep: mux.Response) =>
           try
             classifier.isDefinedAt(deserialized(deserCtx, rep.body))
           catch {
             case _: Throwable => false
           }
-        case _ => false
+        // otherwise, we see if the classifier can handle this as is
+        case _ =>
+          try
+            classifier.isDefinedAt(reqRep)
+          catch {
+            case _: Throwable => false
+          }
       }
     }
 
     def apply(reqRep: ReqRep): ResponseClass =
       reqRep.response match {
+        // we use the deserializer only if its a mux Response
         case Return(rep: mux.Response) =>
           val deserCtx = Contexts.local.getOrElse(DeserializeCtx.Key, NoDeserializerFn)
           if (deserCtx eq NoDeserializeCtx)
@@ -125,7 +133,13 @@ object ThriftMuxResponseClassifier {
           } catch {
             case NonFatal(e) => throw new MatchError(e)
           }
-        case e => throw new MatchError(e)
+        // otherwise, we see if the classifier can handle this as is
+        case _ =>
+          try
+            classifier(reqRep)
+          catch {
+            case NonFatal(e) => throw new MatchError(e)
+          }
       }
   }
 
@@ -139,6 +153,8 @@ object ThriftMuxResponseClassifier {
    */
   private[finagle] val DeserializeCtxOnly: ResponseClassifier =
     new ResponseClassifier {
+      override def toString: String = "DefaultThriftResponseClassifier"
+
       // we want the side-effect of deserialization if it has not
       // yet been done
       private[this] def deserializeIfPossible(rep: Try[Any]): Unit = {

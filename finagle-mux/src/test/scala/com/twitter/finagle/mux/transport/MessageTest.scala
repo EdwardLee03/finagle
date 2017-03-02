@@ -1,10 +1,9 @@
 package com.twitter.finagle.mux.transport
 
-import com.twitter.finagle.{Path, tracing, Dtab, Dentry}
-import com.twitter.io.Charsets
+import com.twitter.finagle.{Dentry, Dtab, Failure, Path, tracing}
+import com.twitter.io.Buf
 import com.twitter.util.Time
 import com.twitter.util.TimeConversions.intToTimeableNumber
-import org.jboss.netty.buffer.ChannelBuffers
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.{AssertionsForJUnit, JUnitRunner}
@@ -14,17 +13,16 @@ import scala.collection.mutable
 class MessageTest extends FunSuite with AssertionsForJUnit {
   import Message._
 
-  def buf(n: Int) = ChannelBuffers.wrappedBuffer((0 until n).toArray.map(_.toByte))
+  def buf(n: Int) = Buf.ByteArray.Owned((0 until n).toArray.map(_.toByte))
   val body = buf(4)
 
   val goodTags = Seq(8388607, 1, 123)
+  val goodVersions = Seq(100: Short, 200: Short, 300: Short)
   val goodTraceIds = Seq(None, Some(tracing.Trace.nextId))
-  val goodBufs = Seq(ChannelBuffers.EMPTY_BUFFER, buf(1), buf(4), buf(100))
+  val goodBufs = Seq(Buf.Empty, buf(1), buf(4), buf(100))
   val goodStrings = Seq("", "Hello, world!", "☺☹")
-  val goodKeys = goodStrings map { s =>
-    val bytes = s.getBytes(Charsets.Utf8)
-    ChannelBuffers.wrappedBuffer(bytes)
-  }
+  val goodKeys = goodStrings.map(Buf.Utf8(_))
+
   val goodDentries = Seq("/a=>/b", "/foo=>/$/inet/twitter.com/80") map(Dentry.read)
   val goodDtabs = goodDentries.permutations map { ds => Dtab(ds.toIndexedSeq) }
   val goodDests = Seq("/", "/okay", "/foo/bar/baz") map(Path.read)
@@ -35,6 +33,18 @@ class MessageTest extends FunSuite with AssertionsForJUnit {
 
   test("d(e(m)) == m") {
     val ms = mutable.Buffer[Message]()
+
+    ms ++= (for {
+      tag <- goodTags
+      version <- goodVersions
+      ctx <- goodContexts
+    } yield Tinit(tag, version, ctx))
+
+    ms ++= (for {
+      tag <- goodTags
+      version <- goodVersions
+      ctx <- goodContexts
+    } yield Rinit(tag, version, ctx))
 
     ms ++= (for {
       tag <- goodTags
@@ -104,26 +114,49 @@ class MessageTest extends FunSuite with AssertionsForJUnit {
   }
 
   test("not encode invalid messages") {
-    assert(intercept[BadMessageException] {
+    assert(intercept[Failure] {
       encode(Treq(-1, Some(tracing.Trace.nextId), body))
-    } == BadMessageException("invalid tag number -1"))
-    assert(intercept[BadMessageException] {
+    } == Failure.wrap(BadMessageException("invalid tag number -1")))
+    assert(intercept[Failure] {
       encode(Treq(1 << 24, Some(tracing.Trace.nextId), body))
-    } == BadMessageException("invalid tag number 16777216"))
+    } == Failure.wrap(BadMessageException("invalid tag number 16777216")))
   }
 
   test("not decode invalid messages") {
-    assert(intercept[BadMessageException] {
-      decode(ChannelBuffers.EMPTY_BUFFER)
-    } == BadMessageException("short message"))
-    assert(intercept[BadMessageException] {
-      decode(ChannelBuffers.wrappedBuffer(Array[Byte](0, 0, 0, 1)))
-    } == BadMessageException("bad message type: 0 [tag=1]"))
+    val short = intercept[Failure] { decode(Buf.Empty) }
+    assert(short.why.startsWith("short message"))
+    assert(short.cause.get.isInstanceOf[BadMessageException])
+
+    assert(intercept[Failure] {
+      decode(Buf.ByteArray.Owned(Array[Byte](0, 0, 0, 1)))
+    } == Failure.wrap(BadMessageException("unknown message type: 0 [tag=1]. Payload bytes: 0. First 0 bytes of the payload: ''")))
+    assert(intercept[Failure] {
+      decode(Buf.ByteArray.Owned(Array[Byte](0, 0, 0, 1, 0x01, 0x02, 0x0e, 0x0f)))
+    } == Failure.wrap(BadMessageException("unknown message type: 0 [tag=1]. Payload bytes: 4. First 4 bytes of the payload: '01020e0f'")))
+    assert(intercept[Failure] {
+      decode(Buf.ByteArray.Owned(Array[Byte](0, 0, 0, 1) ++ Seq.fill(32)(1.toByte).toArray[Byte]))
+    } == Failure.wrap(BadMessageException("unknown message type: 0 [tag=1]. Payload bytes: 32. First 16 bytes of the payload: '01010101010101010101010101010101'")))
+  }
+
+  test("decode fragments") {
+    val msgs = Seq(
+      Tdispatch(Message.Tags.setMsb(goodTags.head),
+        goodContexts.head,
+        goodDests.head,
+        Dtab.empty,
+        goodBufs.head),
+      RdispatchOk(Message.Tags.setMsb(goodTags.last),
+        goodContexts.last,
+        goodBufs.last))
+
+    for (m <- msgs) {
+      assert(decode(encode(m)) == Fragment(m.typ, m.tag, m.buf))
+    }
   }
 
   test("extract control messages") {
     val tag = 0
-    val buf = ChannelBuffers.EMPTY_BUFFER
+    val buf = Buf.Empty
 
     assert(ControlMessage.unapply(Treq(tag, None, buf)) == None)
     assert(ControlMessage.unapply(RreqOk(0, buf)) == None)
@@ -136,5 +169,43 @@ class MessageTest extends FunSuite with AssertionsForJUnit {
     assert(ControlMessage.unapply(Rping(tag)) == Some(tag))
     assert(ControlMessage.unapply(Tdiscarded(tag, "")) == Some(tag))
     assert(ControlMessage.unapply(Tlease(0, 0L)) == Some(tag))
+  }
+
+  test("context entries are backed by Buf.Empty or an exact sized ByteArray") {
+    def checkBuf(buf: Buf): Unit = buf match {
+      case Buf.Empty => assert(true) // ok
+      case Buf.ByteArray.Owned(array, 0, end) => assert(end == array.length)
+      case msg => fail(s"Unexpected Buf: $msg")
+    }
+
+    val msg = RdispatchOk(0, goodContexts.flatten, Buf.Empty)
+    val RdispatchOk(0, ctxs, Buf.Empty) = decode(Buf.ByteArray.coerce(encode(msg)))
+    ctxs.foreach { case (k, v) =>
+      checkBuf(k)
+      checkBuf(v)
+    }
+  }
+
+  test("Message.coerceTrimmed(Buf.Empty)") {
+    val coerced = Message.coerceTrimmed(Buf.Empty)
+    assert(coerced eq Buf.Empty)
+  }
+
+  test("Message.coerceTrimmed(correctly sized ByteArray)") {
+    val exact = Buf.ByteArray(1, 2, 3)
+    val coerced = Message.coerceTrimmed(exact)
+    assert(coerced eq exact)
+  }
+
+  test("Message.coerceTrimmed(sliced Buf)") {
+    val slice = Buf.ByteArray(1, 2, 3).slice(0, 2)
+    val coerced = Message.coerceTrimmed(slice)
+    coerced match {
+      case Buf.ByteArray.Owned(data, 0, 2) =>
+        assert(data.length == 2)
+        assert(data(0) == 1 && data(1) == 2)
+
+      case other => fail(s"Unexpected representation: $other")
+    }
   }
 }

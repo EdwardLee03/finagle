@@ -1,12 +1,18 @@
-scala_library(name='scala',
+scala_library(
   provides = scala_artifact(
     org = 'com.twitter',
     name = 'finagle-commons-stats',
     repo = artifactory,
   ),
   dependencies=[
-    'science/src/java/com/twitter/common/stats:stats',
-    'finagle/finagle-core',
+    '3rdparty/jvm/com/fasterxml/jackson/core:jackson-core',
+    '3rdparty/jvm/com/fasterxml/jackson/core:jackson-databind',
+    '3rdparty/jvm/com/fasterxml/jackson/module:jackson-module-scala',
+    'finagle/finagle-http',
+    'src/java/com/twitter/common/base:base',
+    'src/java/com/twitter/common/stats:stats',
+    'src/java/com/twitter/common/stats:stats-provider',
+    'util/util-core',
     'util/util-registry',
     'util/util-stats',
   ],
@@ -15,4 +21,6 @@ scala_library(name='scala',
   resources=[
     'finagle/finagle-commons-stats/src/main/resources'
   ],
+  # Exposes a service-loaded class.
+  scope='forced',
 )

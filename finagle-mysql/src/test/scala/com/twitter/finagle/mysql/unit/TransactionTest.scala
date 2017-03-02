@@ -1,4 +1,4 @@
-package com.twitter.finagle.exp.mysql
+package com.twitter.finagle.mysql
 
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.mock.MockitoSugar
@@ -6,7 +6,7 @@ import org.scalatest.{MustMatchers, FunSuite}
 import org.junit.runner.RunWith
 import org.mockito.Mockito._
 import org.mockito.Matchers._
-import com.twitter.util.{Await, Future, Time}
+import com.twitter.util.{Await, Time}
 
 /**
  * Tests the transaction functionality of the MySQL client.
@@ -64,4 +64,3 @@ class TransactionTest extends FunSuite with MockitoSugar with MustMatchers {
     verify(factory, times(0)).close(any[Time])
   }
 }
-

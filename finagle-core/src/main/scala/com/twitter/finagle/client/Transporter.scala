@@ -1,20 +1,33 @@
 package com.twitter.finagle.client
 
+import com.twitter.finagle.{Address, Stack}
 import com.twitter.finagle.socks.SocksProxyFlags
-import com.twitter.finagle.Stack
 import com.twitter.finagle.transport.Transport
-import com.twitter.util.Duration
-import com.twitter.util.Future
+import com.twitter.util.{Duration, Future, Time, Closable}
 import java.net.SocketAddress
 
 /**
- * Transporters are simple functions from a `SocketAddress` to a
- * `Future[Transport[In, Out]]`. They represent a transport layer session from a
- * client to a server. Transporters are symmetric to the server-side
- * [[com.twitter.finagle.server.Listener]].
+ * Transporters construct a `Future[Transport[In, Out]]`.
+ *
+ * There is one Transporter assigned per remote peer.  Transporters are
+ * symmetric to the server-side [[com.twitter.finagle.server.Listener]], except
+ * that it isn't shared across remote peers..
  */
-trait Transporter[In, Out] {
-  def apply(addr: SocketAddress): Future[Transport[In, Out]]
+trait Transporter[In, Out] extends Closable {
+  def apply(): Future[Transport[In, Out]]
+
+  /**
+   * The address of the remote peer that this `Transporter` connects to.
+   */
+  def remoteAddress: SocketAddress
+
+  /**
+   * Some `Transporters` build `Transports` that represent streams in a
+   * connection instead of connections themselves.  When this is the case, this
+   * method should be overridden to destroy the underlying connection when it's
+   * finished.
+   */
+  def close(deadline: Time): Future[Unit] = Future.Done
 }
 
 /**
@@ -29,14 +42,13 @@ object Transporter {
   /**
    * $param a `SocketAddress` that a `Transporter` connects to.
    */
-  case class EndpointAddr(addr: SocketAddress) {
+  case class EndpointAddr(addr: Address) {
     def mk(): (EndpointAddr, Stack.Param[EndpointAddr]) =
       (this, EndpointAddr.param)
   }
   object EndpointAddr {
-    implicit val param = Stack.Param(EndpointAddr(new SocketAddress {
-      override def toString = "noaddr"
-    }))
+    implicit val param =
+      Stack.Param(EndpointAddr(Address.failing))
   }
 
   /**
@@ -54,18 +66,6 @@ object Transporter {
   }
   object ConnectTimeout {
     implicit val param = Stack.Param(ConnectTimeout(1.second))
-  }
-
-  /**
-   * $param hostname verification, if TLS is enabled.
-   * @see [[com.twitter.finagle.transport.Transport#TLSEngine]]
-   */
-  case class TLSHostname(hostname: Option[String]) {
-    def mk(): (TLSHostname, Stack.Param[TLSHostname]) =
-      (this, TLSHostname.param)
-  }
-  object TLSHostname {
-    implicit val param = Stack.Param(TLSHostname(None))
   }
 
   /**
@@ -94,6 +94,11 @@ object Transporter {
   }
   object HttpProxy {
     implicit val param = Stack.Param(HttpProxy(None, None))
+  }
+
+  case class HttpProxyTo(hostAndCredentials: Option[(String, Option[Credentials])])
+  object HttpProxyTo {
+    implicit val param = Stack.Param(HttpProxyTo(None))
   }
 
   /**

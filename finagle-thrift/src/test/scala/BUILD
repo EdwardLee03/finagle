@@ -1,26 +1,25 @@
-junit_tests(name='scala',
+junit_tests(
   dependencies=[
-    '3rdparty/jvm/junit',
-    '3rdparty/jvm/org/mockito:mockito-all',
+    '3rdparty/jvm/com/google/guava:guava',
     '3rdparty/jvm/io/netty',
+    '3rdparty/jvm/junit',
+    '3rdparty/jvm/org/apache/thrift:libthrift-0.5.0',
+    '3rdparty/jvm/org/mockito:mockito-all',
     '3rdparty/jvm/org/scalatest',
-    '3rdparty/jvm/org/apache/thrift:thrift-0.5.0',
-    'finagle/finagle-core',
+    'finagle/finagle-core/src/main/scala:scala',
     'finagle/finagle-thrift',
+    'finagle/finagle-thrift/src/main/java:java',
     'finagle/finagle-thrift/src/test/java',
-    'finagle/finagle-thrift/src/test/thrift',
-    'util/util-core',
-
-    ':silly-thrift-dep',
+    'finagle/finagle-thrift/src/test/thrift:thrift-java',
+    'finagle/finagle-thrift/src/test/thrift:thrift-scala',
+    'scrooge/scrooge-core/src/main/scala:scala',
+    'util/util-app/src/main/scala:scala',
+    'util/util-core/src/main/scala:scala',
+    'util/util-stats/src/main/scala:scala',
   ],
   resources=[
     'finagle/finagle-thrift/src/test/resources',
   ],
-  sources=rglobs('*.scala')
-)
-
-jar_library(name='silly-thrift-dep',
-  jars=[
-    jar(org='silly', name='silly-thrift', rev='0.5.0'),
-  ],
+  sources=rglobs('*.scala'),
+  fatal_warnings=True,
 )

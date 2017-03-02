@@ -1,20 +1,23 @@
 package com.twitter.finagle.memcached.protocol
 
-import com.twitter.finagle.memcached.util.Bufs
 import com.twitter.io.Buf
 import com.twitter.util.Time
+import scala.collection.immutable
 
 private object KeyValidation {
   private val MaxKeyLength = 250
 
   private def tooLong(key: Buf): Boolean = key.length > MaxKeyLength
 
+  private[this] def invalidChar(b: Byte): Boolean =
+    b <= ' ' && (b == '\n' || b == '\u0000' || b == '\r' || b == ' ')
+
   /** Return -1 if no invalid bytes */
   private def invalidByteIndex(key: Buf): Int = {
     val bs = Buf.ByteArray.Owned.extract(key)
     var i = 0
     while (i < bs.length) {
-      if (Bufs.INVALID_KEY_CHARACTERS.contains(bs(i)))
+      if (invalidChar(bs(i)))
         return i
       i += 1
     }
@@ -69,6 +72,12 @@ trait KeyValidation {
 }
 
 sealed abstract class Command(val name: String)
+
+private[memcached] object StorageCommand {
+  val StorageCommands = immutable.Set[Buf](
+    Buf.Utf8("set"), Buf.Utf8("add"), Buf.Utf8("replace"), Buf.Utf8("append"), Buf.Utf8("prepend"),
+    Buf.Utf8("cas"))
+}
 
 abstract class StorageCommand(
     key: Buf,

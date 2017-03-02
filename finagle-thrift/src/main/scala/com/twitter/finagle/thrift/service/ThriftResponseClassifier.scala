@@ -3,14 +3,15 @@ package com.twitter.finagle.thrift.service
 import com.twitter.finagle.context.Contexts
 import com.twitter.finagle.service._
 import com.twitter.finagle.thrift.DeserializeCtx
-import com.twitter.util.{NonFatal, Return, Try, Throw}
+import com.twitter.util.{Return, Try, Throw}
+import scala.util.control.NonFatal
 
 /**
- * [[ResponseClassifier ResponseClassifiers]] for use with `finagle-thrift`
+ * `ResponseClassifiers` for use with `finagle-thrift`
  * request/responses.
  *
  * Thrift (and ThriftMux) services are a bit unusual in that
- * there is only a single [[com.twitter.finagle.Service]] from `Array[Byte]`
+ * there is only a single `Service` from `Array[Byte]`
  * to `Array[Byte]` for all the methods of an IDL's service.
  *
  * Thrift classifiers should be written in terms
@@ -51,7 +52,7 @@ object ThriftResponseClassifier {
 
   /**
    * Categorizes responses where the '''deserialized''' response is a
-   * Thrift Exception as a [[ResponseClass.NonRetryableFailure]].
+   * Thrift Exception as a `ResponseClass.NonRetryableFailure`.
    */
   val ThriftExceptionsAsFailures: ResponseClassifier =
     ResponseClassifier.named("ThriftExceptionsAsFailures") {
@@ -102,18 +103,26 @@ object ThriftResponseClassifier {
         return false
 
       reqRep.response match {
+        // we use the deserializer only if its a thrift response
         case Return(bytes: Array[Byte]) =>
           try
             classifier.isDefinedAt(deserialized(deserCtx, bytes))
           catch {
             case _: Throwable => false
           }
-        case _ => false
+        // otherwise, we see if the classifier can handle this as is
+        case _ =>
+          try
+            classifier.isDefinedAt(reqRep)
+          catch {
+            case _: Throwable => false
+          }
       }
     }
 
     def apply(reqRep: ReqRep): ResponseClass =
       reqRep.response match {
+        // we use the deserializer only if its a thrift response
         case Return(bytes: Array[Byte]) =>
           val deserCtx = Contexts.local.getOrElse(DeserializeCtx.Key, NoDeserializerFn)
           if (deserCtx eq NoDeserializeCtx)
@@ -123,7 +132,13 @@ object ThriftResponseClassifier {
           } catch {
             case NonFatal(e) => throw new MatchError(e)
           }
-        case e => throw new MatchError(e)
+        // otherwise, we see if the classifier can handle this as is
+        case _ =>
+          try
+            classifier(reqRep)
+          catch {
+            case NonFatal(e) => throw new MatchError(e)
+          }
       }
   }
 
@@ -137,6 +152,8 @@ object ThriftResponseClassifier {
    */
   private[finagle] val DeserializeCtxOnly: ResponseClassifier =
     new ResponseClassifier {
+      override def toString: String = "DefaultThriftResponseClassifier"
+
       // we want the side-effect of deserialization if it has not
       // yet been done
       private[this] def deserializeIfPossible(rep: Try[Any]): Unit = {

@@ -1,11 +1,11 @@
 package com.twitter.finagle.dispatch
 
-import com.twitter.concurrent.{AsyncSemaphore, Permit}
+import com.twitter.concurrent.AsyncSemaphore
 import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
 import com.twitter.finagle.tracing.Trace
 import com.twitter.finagle.transport.Transport
 import com.twitter.finagle.{Status, Service, Failure, WriteException}
-import com.twitter.util.{Future, Time, Promise, Throw, Return}
+import com.twitter.util._
 import java.net.InetSocketAddress
 
 /**
@@ -33,6 +33,16 @@ abstract class GenSerialClientDispatcher[Req, Rep, In, Out](
     case _ => new InetSocketAddress(0)
   }
 
+
+  // satisfy pending requests on transport close
+  trans.onClose.respond { res =>
+    val exc = res match {
+      case Return(exc) => exc
+      case Throw(exc) => exc
+    }
+
+    semaphore.fail(exc)
+  }
 
   /**
    * Dispatch a request, satisfying Promise `p` with the response;
@@ -122,5 +132,4 @@ class SerialClientDispatcher[Req, Rep](
       .unit
 
   protected def write(req: Req): Future[Unit] = trans.write(req)
-  protected def read(permit: Permit): Future[Rep] = trans.read().ensure { permit.release() }
 }

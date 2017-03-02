@@ -3,13 +3,11 @@ package com.twitter.finagle.mux
 import com.twitter.concurrent.AsyncQueue
 import com.twitter.conversions.time._
 import com.twitter.finagle.mux.transport.Message
-import com.twitter.finagle.stats.{NullStatsReceiver, InMemoryStatsReceiver, StatsReceiver}
-import com.twitter.finagle.transport.{Transport, QueueTransport}
+import com.twitter.finagle.stats.InMemoryStatsReceiver
+import com.twitter.finagle.transport.QueueTransport
 import com.twitter.finagle.{Failure, Dtab, Path, Status}
-import com.twitter.io.Charsets
-import com.twitter.util.{Await, Return, Throw, Time, TimeControl, Duration, Future}
-import java.nio.charset.Charset
-import org.jboss.netty.buffer.ChannelBuffers
+import com.twitter.io.Buf
+import com.twitter.util.{Await, Throw, Time}
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
@@ -27,13 +25,13 @@ private class ClientSessionTest extends FunSuite {
     val session = new ClientSession(transport, FailureDetector.NullConfig, "test", stats)
 
     def send(msg: Message) = {
-      Await.result(session.write(msg))
-      Await.result(clientToServer.poll())
+      Await.result(session.write(msg), 10.seconds)
+      Await.result(clientToServer.poll(), 10.seconds)
     }
 
     def recv(msg: Message) = {
       serverToClient.offer(msg)
-      Await.result(session.read())
+      Await.result(session.read(), 10.seconds)
     }
   }
 
@@ -58,7 +56,8 @@ private class ClientSessionTest extends FunSuite {
       val ctx = new Ctx
       import ctx._
 
-      val buf = ChannelBuffers.copiedBuffer("OK", Charsets.Utf8)
+      val buf = Buf.Utf8("OK")
+
       val req = Message.Tdispatch(2, Seq.empty, Path.empty, Dtab.empty, buf)
 
       // 2 outstanding req, it's okay to use the same tag
@@ -68,7 +67,7 @@ private class ClientSessionTest extends FunSuite {
 
       val tag = 5
       recv(Message.Tdrain(tag))
-      assert(Await.result(clientToServer.poll()) == Message.Rdrain(tag))
+      assert(Await.result(clientToServer.poll(), 10.seconds) == Message.Rdrain(tag))
       assert(session.status == Status.Busy)
 
       session.write(req).poll match {
@@ -102,11 +101,11 @@ private class ClientSessionTest extends FunSuite {
       case _ => fail()
     }
 
-    recv(Message.Rping(Message.PingTag))
+    recv(Message.Rping(Message.Tags.PingTag))
     assert(ping0.isDefined)
 
     val ping1 = session.ping()
-    recv(Message.Rping(Message.PingTag))
+    recv(Message.Rping(Message.Tags.PingTag))
     assert(ping1.isDefined)
   }
 }

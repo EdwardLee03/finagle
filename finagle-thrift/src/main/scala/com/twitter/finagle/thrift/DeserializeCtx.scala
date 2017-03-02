@@ -1,7 +1,6 @@
 package com.twitter.finagle.thrift
 
 import com.twitter.finagle.context.Contexts
-import com.twitter.scrooge.ThriftStruct
 import com.twitter.util.Try
 
 /**
@@ -17,10 +16,11 @@ import com.twitter.util.Try
  * of a single request/response pair.
  *
  * @param request the request that was used to generate response
- * to be seen by [[deserialize]].
+ * to be seen by [[deserialize]]. `request` is of type `Any` because
+ * requests in generated Scala and Java services do not share a supertype.
  */
 class DeserializeCtx[Rep](
-    val request: ThriftStruct,
+    val request: Any,
     replyDeserializer: Array[Byte] => Try[Rep]) {
 
   // thread safety provided via synchronization on this

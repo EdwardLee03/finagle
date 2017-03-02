@@ -2,27 +2,42 @@ package com.twitter.finagle
 
 import com.twitter.finagle
 import com.twitter.finagle.client._
-import com.twitter.finagle.dispatch.{GenSerialClientDispatcher, PipeliningDispatcher}
-import com.twitter.finagle.netty3.Netty3Transporter
-import com.twitter.finagle.param.{Monitor => _, ResponseClassifier => _, ExceptionStatsHandler => _, Tracer => _, _}
-import com.twitter.finagle.pool.SingletonPool
-import com.twitter.finagle.redis.protocol.{Command, Reply}
+import com.twitter.finagle.dispatch.GenSerialClientDispatcher
+import com.twitter.finagle.netty4.Netty4Transporter
+import com.twitter.finagle.param.{
+  ExceptionStatsHandler => _, Monitor => _, ResponseClassifier => _, Tracer => _, _}
+import com.twitter.finagle.redis.exp.RedisPool
+import com.twitter.finagle.redis.protocol.{Command, Reply, StageTransport}
 import com.twitter.finagle.service.{ResponseClassifier, RetryBudget}
 import com.twitter.finagle.stats.{ExceptionStatsHandler, StatsReceiver}
 import com.twitter.finagle.tracing.Tracer
 import com.twitter.finagle.transport.Transport
+import com.twitter.io.Buf
 import com.twitter.util.{Duration, Monitor}
+import java.net.SocketAddress
 
 trait RedisRichClient { self: Client[Command, Reply] =>
 
   def newRichClient(dest: String): redis.Client =
-     redis.Client(newService(dest))
+    redis.Client(newClient(dest))
 
   def newRichClient(dest: Name, label: String): redis.Client =
-    redis.Client(newService(dest, label))
+    redis.Client(newClient(dest, label))
+
+  def newSentinelClient(dest: String): redis.SentinelClient =
+    redis.SentinelClient(newClient(dest))
+
+  def newSentinelClient(dest: Name, label: String): redis.SentinelClient =
+    redis.SentinelClient(newClient(dest, label))
+
+  def newTransactionalClient(dest: String): redis.TransactionalClient =
+    redis.TransactionalClient(newClient(dest))
+
+  def newTransactionalClient(dest: Name, label: String): redis.TransactionalClient =
+    redis.TransactionalClient(newClient(dest, label))
 }
 
-object Redis extends Client[Command, Reply] {
+object Redis extends Client[Command, Reply] with RedisRichClient {
 
   object Client {
     /**
@@ -35,7 +50,7 @@ object Redis extends Client[Command, Reply] {
      * A default client stack which supports the pipelined redis client.
      */
     def newStack: Stack[ServiceFactory[Command, Reply]] = StackClient.newStack
-      .replace(DefaultPool.Role, SingletonPool.module[Command, Reply])
+      .insertBefore(DefaultPool.Role, RedisPool.module)
   }
 
   case class Client(
@@ -50,15 +65,15 @@ object Redis extends Client[Command, Reply] {
       params: Stack.Params = this.params
     ): Client = copy(stack, params)
 
-    protected type In = Command
-    protected type Out = Reply
+    protected type In = Buf
+    protected type Out = Buf
 
-    protected def newTransporter(): Transporter[In, Out] =
-      Netty3Transporter(redis.RedisClientPipelineFactory, params)
+    protected def newTransporter(addr: SocketAddress): Transporter[In, Out] =
+      Netty4Transporter.framedBuf(None /* no Framer */, addr, params)
 
     protected def newDispatcher(transport: Transport[In, Out]): Service[Command, Reply] =
-      new PipeliningDispatcher(
-        transport,
+      RedisPool.newDispatcher(
+        new StageTransport(transport),
         params[finagle.param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
       )
 
@@ -68,8 +83,8 @@ object Redis extends Client[Command, Reply] {
       new DefaultLoadBalancingParams(this)
     override val withTransport: ClientTransportParams[Client] =
       new ClientTransportParams(this)
-    override val withSession: SessionParams[Client] =
-      new SessionParams(this)
+    override val withSession: ClientSessionParams[Client] =
+      new ClientSessionParams(this)
     override val withSessionQualifier: SessionQualificationParams[Client] =
       new SessionQualificationParams(this)
     override val withAdmissionControl: ClientAdmissionControlParams[Client] =

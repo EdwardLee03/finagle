@@ -4,13 +4,13 @@ import _root_.java.net.{InetSocketAddress, SocketAddress}
 import _root_.java.nio.charset.Charset
 import _root_.java.util.concurrent.{BlockingDeque, ExecutorService, Executors, LinkedBlockingDeque}
 
-import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache}
+import com.github.benmanes.caffeine.cache.{Caffeine, CacheLoader, LoadingCache}
 import com.twitter.concurrent.{Broker, Spool}
 import com.twitter.conversions.time._
 import com.twitter.finagle.builder.{ClientBuilder, ClientConfig, Cluster}
 import com.twitter.finagle.kestrel._
 import com.twitter.finagle.kestrel.protocol.{Command, Response, Set}
-import com.twitter.finagle.{Addr, ClientConnection, Service, ServiceFactory}
+import com.twitter.finagle._
 import com.twitter.io.Buf
 import com.twitter.util._
 import org.junit.runner.RunWith
@@ -24,6 +24,15 @@ import scala.language.postfixOps
 
 import scala.collection.immutable.{Set => ISet}
 import scala.collection.mutable.{ArrayBuffer, Set => MSet}
+
+object TestNamer {
+  val va = Var[Addr](Addr.Pending)
+}
+
+class TestNamer extends Namer {
+  override def lookup(path: Path) =
+    Activity.value(NameTree.Leaf(Name.Bound.singleton(TestNamer.va)))
+}
 
 @RunWith(classOf[JUnitRunner])
 class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with IntegrationPatience {
@@ -49,7 +58,8 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
     val queueNameBuf = Buf.Utf8(queueName)
     val N = 3
     val hosts = 0 until N map { i =>
-      InetSocketAddress.createUnresolved("10.0.0.%d".format(i), 22133)
+      Address(
+        InetSocketAddress.createUnresolved("10.0.0.%d".format(i), 22133))
     }
 
     val executor = Executors.newCachedThreadPool()
@@ -77,9 +87,9 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
     }
 
     val hostQueuesMap = hosts.map { host =>
-      val queues = CacheBuilder.newBuilder()
+      val queues = Caffeine.newBuilder()
         .build(new CacheLoader[Buf, BlockingDeque[Buf]] {
-        def load(k: Buf) = new LinkedBlockingDeque[Buf]
+        def load(k: Buf): BlockingDeque[Buf] = new LinkedBlockingDeque[Buf]
       })
       (host, queues)
     }.toMap
@@ -90,7 +100,7 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
       hosts.foreach { host =>
         val mockHostClientBuilder =
           mock[ClientBuilder[Command, Response, ClientConfig.Yes, ClientConfig.Yes, ClientConfig.Yes]]
-        when(result.hosts(host)) thenReturn mockHostClientBuilder
+        when(result.addrs(host)) thenReturn mockHostClientBuilder
 
         val queues = hostQueuesMap(host)
         val factory = new ServiceFactory[Command, Response] {
@@ -121,6 +131,14 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
         msg.ack.sync()
       }
       messages
+    }
+
+    val sentMessages = Seq.tabulate(N * 10) { i => s"message $i" }
+
+    def sendMessages(): Unit = {
+      sentMessages.zipWithIndex.foreach { case (m, i) =>
+        Await.result(services(i % services.size).apply(Set(queueNameBuf, Time.now, Buf.Utf8(m))))
+      }
     }
   }
 
@@ -178,9 +196,9 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
     }
 
     val hostQueuesMap = hosts.map { host =>
-      val queues = CacheBuilder.newBuilder()
+      val queues = Caffeine.newBuilder()
         .build(new CacheLoader[Buf, BlockingDeque[Buf]] {
-        def load(k: Buf) = new LinkedBlockingDeque[Buf]
+        def load(k: Buf): BlockingDeque[Buf] = new LinkedBlockingDeque[Buf]
       })
       (host, queues)
     }.toMap
@@ -191,7 +209,7 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
       hosts.foreach { host =>
         val mockHostClientBuilder =
           mock[ClientBuilder[Command, Response, ClientConfig.Yes, ClientConfig.Yes, ClientConfig.Yes]]
-        when(result.hosts(host)) thenReturn mockHostClientBuilder
+        when(result.addrs(Address(host))) thenReturn mockHostClientBuilder
 
         val queues = hostQueuesMap(host)
         val factory = new ServiceFactory[Command, Response] {
@@ -290,12 +308,25 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
       val va = Var(Addr.Bound(hosts: _*))
       val handle = MultiReader(va, queueName).clientBuilder(mockClientBuilder).build()
       val messages = configureMessageReader(handle)
-      val sentMessages = 0 until N * 10 map { i => "message %d".format(i) }
       assert(messages.size == 0)
 
-      sentMessages.zipWithIndex foreach { case (m, i) =>
-        Await.result(services(i % services.size).apply(Set(queueNameBuf, Time.now, Buf.Utf8(m))))
+      sendMessages()
+
+      eventually {
+        assert(messages == sentMessages.toSet)
       }
+    }
+  }
+
+  test("Name.Path-based cluster should read messages from a ready cluster") {
+    new AddrClusterHelper {
+      val handle = MultiReaderMemcache("/$/com.twitter.finagle.kestrel.unit.TestNamer", queueName)
+        .clientBuilder(mockClientBuilder).build()
+      TestNamer.va() = Addr.Bound(hosts.toSet)
+      val messages = configureMessageReader(handle)
+      assert(messages.size == 0)
+
+      sendMessages()
 
       eventually {
         assert(messages == sentMessages.toSet)
@@ -308,12 +339,9 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
       val va = Var(Addr.Bound(hosts.head))
       val handle = MultiReader(va, queueName).clientBuilder(mockClientBuilder).build()
       val messages = configureMessageReader(handle)
-      val sentMessages = 0 until N * 10 map { i => "message %d".format(i) }
       assert(messages.size == 0)
 
-      sentMessages.zipWithIndex foreach { case (m, i) =>
-        Await.result(services(i % services.size).apply(Set(queueNameBuf, Time.now, Buf.Utf8(m))))
-      }
+      sendMessages()
 
       // 0, 3, 6 ...
       eventually {
@@ -332,18 +360,15 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
 
   test("Var[Addr]-based cluster should read messages as cluster hosts are removed") {
     new AddrClusterHelper {
-      var mutableHosts: Seq[SocketAddress] = hosts
+      var mutableHosts: Seq[Address] = hosts
       val va = Var(Addr.Bound(mutableHosts: _*))
       val rest = hosts.tail.reverse
       val handle = MultiReader(va, queueName).clientBuilder(mockClientBuilder).build()
 
       val messages = configureMessageReader(handle)
-      val sentMessages = 0 until N * 10 map { i => "message %d".format(i) }
       assert(messages.size == 0)
 
-      sentMessages.zipWithIndex foreach { case (m, i) =>
-        Await.result(services(i % services.size).apply(Set(queueNameBuf, Time.now, Buf.Utf8(m))))
-      }
+      sendMessages()
 
       eventually {
         assert(messages == sentMessages.toSet)
@@ -373,12 +398,9 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
       val handle = MultiReader(va, queueName).clientBuilder(mockClientBuilder).build()
       val messages = configureMessageReader(handle)
       val error = handle.error.sync()
-      val sentMessages = 0 until N * 10 map { i => "message %d".format(i) }
       assert(messages.size == 0)
 
-      sentMessages.zipWithIndex foreach { case (m, i) =>
-        Await.result(services(i % services.size).apply(Set(queueNameBuf, Time.now, Buf.Utf8(m))))
-      }
+      sendMessages()
 
       assert(messages.size == 0) // cluster not ready
       assert(error.isDefined == false)
@@ -413,6 +435,23 @@ class MultiReaderTest extends FunSuite with MockitoSugar with Eventually with In
 
       assert(error.isDefined == true)
       assert(Await.result(error) == ex)
+    }
+  }
+
+  test("Var[Addr]-based cluster should use last known good state if addr becomes Pending") {
+    new AddrClusterHelper {
+      val va: Var[Addr] with Updatable[Addr] = Var(Addr.Bound(hosts: _*))
+      val handle = MultiReader(va, queueName).clientBuilder(mockClientBuilder).build()
+      va.update(Addr.Pending)
+
+      val messages = configureMessageReader(handle)
+      assert(messages.size == 0)
+
+      sendMessages()
+
+      eventually {
+        assert(messages == sentMessages.toSet)
+      }
     }
   }
 

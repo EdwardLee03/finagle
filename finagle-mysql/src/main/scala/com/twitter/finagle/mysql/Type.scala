@@ -1,7 +1,4 @@
-package com.twitter.finagle.exp.mysql
-
-import java.nio.charset.{Charset => JCharset}
-import com.twitter.finagle.exp.mysql.transport.Buffer
+package com.twitter.finagle.mysql
 
 object Type {
   /**

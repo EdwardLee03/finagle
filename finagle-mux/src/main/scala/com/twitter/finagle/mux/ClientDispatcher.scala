@@ -1,13 +1,13 @@
 package com.twitter.finagle.mux
 
 import com.twitter.finagle.context.Contexts
-import com.twitter.finagle.mux.transport.Message
+import com.twitter.finagle.mux.transport.{Message, MuxFailure}
 import com.twitter.finagle.mux.util.{TagMap, TagSet}
-import com.twitter.finagle.netty3.{BufChannelBuffer, ChannelBufferBuf}
 import com.twitter.finagle.tracing.Trace
 import com.twitter.finagle.transport.Transport
-import com.twitter.finagle.{Dtab, Filter, Failure, NoStacktrace, Service, Status}
+import com.twitter.finagle.{Dtab, Filter, Failure, Service, Status}
 import com.twitter.util.{Future, Promise, Return, Throw, Time, Try, Updatable}
+import scala.util.control.NoStackTrace
 
 /**
  * Indicates that the server failed to interpret or act on the request. This
@@ -16,7 +16,7 @@ import com.twitter.util.{Future, Promise, Return, Throw, Time, Try, Updatable}
  */
 case class ServerError(what: String)
   extends Exception(what)
-  with NoStacktrace
+  with NoStackTrace
 
 /**
  * Indicates that the server encountered an error whilst processing the client's
@@ -26,7 +26,7 @@ case class ServerError(what: String)
  */
 case class ServerApplicationError(what: String)
   extends Exception(what)
-  with NoStacktrace
+  with NoStackTrace
 
 /**
  * Implements a dispatcher for a mux client. The dispatcher implements the bookkeeping
@@ -39,7 +39,7 @@ private[twitter] class ClientDispatcher(trans: Transport[Message, Message])
 
   // outstanding messages, each tagged with a unique int
   // between `MinTag` and `MaxTag`.
-  private[this] val tags = TagSet(Message.MinTag to Message.MaxTag)
+  private[this] val tags = TagSet(Message.Tags.MinTag to Message.Tags.MaxTag)
   private[this] val messages = TagMap[Updatable[Try[Message]]](tags)
 
   private[this] val processAndRead: Message => Future[Unit] =
@@ -138,18 +138,30 @@ private class ReqRepFilter extends Filter[Request, Response, Int => Message, Mes
 
   private[this] def reply(msg: Try[Message]): Future[Response] = msg match {
       case Return(Message.RreqOk(_, rep)) =>
-        Future.value(Response(ChannelBufferBuf.Owned(rep)))
+        Future.value(Response(rep))
 
       case Return(Message.RreqError(_, error)) =>
         Future.exception(ServerApplicationError(error))
 
       case Return(Message.RdispatchOk(_, _, rep)) =>
-        Future.value(Response(ChannelBufferBuf.Owned(rep)))
+        Future.value(Response(rep))
 
-     case Return(Message.RdispatchError(_, _, error)) =>
-        Future.exception(ServerApplicationError(error))
+      case Return(Message.RdispatchError(_, contexts, error)) =>
+        val appError = ServerApplicationError(error)
+        val exn = MuxFailure.fromContexts(contexts) match {
+          case Some(f) => Failure(appError, f.finagleFlags)
+          case None => appError
+        }
+        Future.exception(exn)
 
-      case Return(Message.RreqNack(_)) | Return(Message.RdispatchNack(_, _))  =>
+      case Return(Message.RdispatchNack(_, contexts)) =>
+        val exn = MuxFailure.fromContexts(contexts) match {
+          case Some(f) => Failure(NackedException.why, f.finagleFlags)
+          case None => NackedException
+        }
+        Future.exception(exn)
+
+      case Return(Message.RreqNack(_)) =>
         FutureNackedException
 
       case t@Throw(_) => Future.const(t.cast[Response])
@@ -161,15 +173,12 @@ private class ReqRepFilter extends Filter[Request, Response, Int => Message, Mes
 
     val msg = couldDispatch match {
       case CanDispatch.No => { tag: Int =>
-        Message.Treq(tag, Some(Trace.id), BufChannelBuffer(req.body))
+        Message.Treq(tag, Some(Trace.id), req.body)
       }
 
       case CanDispatch.Yes | CanDispatch.Unknown => { tag: Int =>
-        val contexts = Contexts.broadcast.marshal().map {
-          case (k, v) => (BufChannelBuffer(k), BufChannelBuffer(v))
-        }
-        Message.Tdispatch(tag, contexts.toSeq, req.destination, Dtab.local,
-          BufChannelBuffer(req.body))
+        val contexts = Contexts.broadcast.marshal()
+        Message.Tdispatch(tag, contexts.toSeq, req.destination, Dtab.local, req.body)
       }
     }
 
@@ -191,8 +200,8 @@ private class ReqRepFilter extends Filter[Request, Response, Int => Message, Mes
 }
 
 private object ReqRepFilter {
-  val FutureNackedException = Future.exception(
-    Failure.rejected("The request was Nacked by the server"))
+  val NackedException = Failure.rejected("The request was Nacked by the server")
+  val FutureNackedException = Future.exception(NackedException)
 
   /** Indicates if our peer can accept `Tdispatch` messages. */
   object CanDispatch extends Enumeration {

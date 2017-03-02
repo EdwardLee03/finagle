@@ -1,10 +1,12 @@
 package com.twitter.finagle.tracing
 
-import com.twitter.finagle.{SimpleFilter, Filter, Dtab, Service}
+import com.twitter.finagle.{Filter, Dtab, Service}
 import com.twitter.util.{Await, Future}
 import org.junit.runner.RunWith
 import org.mockito.ArgumentCaptor
-import org.mockito.Mockito.{spy, verify, atLeastOnce}
+import org.mockito.Mockito.{spy, verify, when, atLeastOnce}
+import org.mockito.Matchers.any
+import org.scalactic.source.Position
 import org.scalatest.junit.{AssertionsForJUnit, JUnitRunner}
 import org.scalatest.mock.MockitoSugar
 import org.scalatest.{BeforeAndAfter, FunSuite, Tag}
@@ -21,9 +23,10 @@ class TracingFilterTest
   var tracer: Tracer = _
   var captor: ArgumentCaptor[Record] = _
 
-  override def test(testName: String, testTags: Tag*)(f: => Unit) {
+  override def test(testName: String, testTags: Tag*)(f: => Any)(implicit pos: Position) {
     super.test(testName, testTags:_*) {
       tracer = spy(new NullTracer)
+      when(tracer.isActivelyTracing(any[TraceId])).thenReturn(true)
       captor = ArgumentCaptor.forClass(classOf[Record])
       Trace.letTracer(tracer) { f }
     }
@@ -41,15 +44,6 @@ class TracingFilterTest
     intercept[Exception] { Await.result(composed(4)) }
     verify(tracer, atLeastOnce()).record(captor.capture())
     captor.getAllValues.asScala
-  }
-
-  test("TracingFilter: should trace Finagle version") {
-    val filter = new TracingFilter[Int, Int](tracer, "tracerTest")
-    val versionKeyFound = record(filter) exists {
-      case Record(_, _, Annotation.BinaryAnnotation(key, _), _) => key == "finagle.version"
-      case _ => false
-    }
-    assert(versionKeyFound, "Finagle version wasn't traced as a binary record")
   }
 
   def testAnnotatingTracingFilter(

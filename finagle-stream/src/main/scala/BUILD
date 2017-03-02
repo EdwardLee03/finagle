@@ -1,4 +1,4 @@
-scala_library(name='scala',
+scala_library(
   provides = scala_artifact(
     org = 'com.twitter',
     name = 'finagle-stream',
@@ -6,8 +6,9 @@ scala_library(name='scala',
   ),
   dependencies=[
     '3rdparty/jvm/io/netty',
-    'finagle/finagle-core',
-    'util/util-core',
+    'finagle/finagle-core/src/main/scala:scala',
+    'util/util-core/src/main/scala:scala',
+    'util/util-stats/src/main/scala:scala',
   ],
   fatal_warnings=True,
   sources=rglobs('*.scala'),

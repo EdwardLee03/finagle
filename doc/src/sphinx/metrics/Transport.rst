@@ -38,7 +38,10 @@ ChannelStatsHandler
   A counter of the total number of successful connections made.
 
 **closes**
-  A counter of the total number of channel close operations.
+  A counter of the total number of channel close operations initiated. To see the
+  total number of closes completed, use the total count from one of the
+  "connection_duration", "connection_received_bytes", or "connection_sent_bytes"
+  histograms.
 
 **connection_duration**
   A histogram of the duration of the lifetime of a connection.
@@ -54,9 +57,6 @@ ChannelStatsHandler
 
 **sent_bytes**
   A counter of the total number of sent bytes.
-
-**closechans**
-  A counter of the total number of connections closed.
 
 **writableDuration**
   A gauge of the length of time the socket has been writable in the channel.
@@ -79,19 +79,6 @@ IdleChannelHandler
   A counter of the number of times a connection was disconnected because of a
   given idle state.
 
-IdleConnectionFilter
-<<<<<<<<<<<<<<<<<<<<
-
-**refused**
-  A counter of the number of connections that have been refused because we have
-  hit the high watermark of connections full and no connections are idle.
-
-**idle**
-  A gauge of the number of connections that are "idle" at this moment.
-
-**closed**
-  A counter of the number of connections that have been closed for being idle.
-
 Thrift
 <<<<<<
 
@@ -104,3 +91,13 @@ Thrift
   frequently. Use the ``com.twitter.finagle.Thrift.param.MaxReusableBufferSize``
   param to set the max buffer size to the size of a typical thrift response for
   your server.
+
+RecvBufferSizeStatsHandler (when Netty 4 pooling is enabled)
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+**transport/receive_buffer_bytes**
+  A histogram of the receive buffer size in bytes. This metric is useful when
+  it comes to tuning pooling of receive buffers in ``finagle-netty4`` (can be enabled
+  with a flag: `-com.twitter.finagle.netty.poolReceiveBuffers`). For maximum throughput,
+  pool's chunk size should be bigger than ``receive_buffer_bytes.max`` of any client/server
+  running on a given JVM.

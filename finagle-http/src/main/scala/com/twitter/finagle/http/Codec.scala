@@ -1,28 +1,39 @@
 package com.twitter.finagle.http
 
 import com.twitter.conversions.storage._
+import com.twitter.finagle
 import com.twitter.finagle._
 import com.twitter.finagle.dispatch.GenSerialClientDispatcher
+import com.twitter.finagle.filter.PayloadSizeFilter
 import com.twitter.finagle.http.codec._
 import com.twitter.finagle.http.filter.{ClientContextFilter, DtabFilter, HttpNackFilter, ServerContextFilter}
-import com.twitter.finagle.stats.{NullStatsReceiver, StatsReceiver}
-import com.twitter.finagle.tracing._
+import com.twitter.finagle.http.netty.{BadMessageConverter, ClientExceptionMapper, Netty3ClientStreamTransport, Netty3ServerStreamTransport}
+import com.twitter.finagle.netty4.http.exp.HttpCodecName
+import com.twitter.finagle.stats.{NullStatsReceiver, ServerStatsReceiver, StatsReceiver}
+import com.twitter.finagle.tracing.{Flags, SpanId, Trace, TraceId, TraceInitializerFilter}
 import com.twitter.finagle.transport.Transport
-import com.twitter.util.{Closable, StorageUnit, Try}
-import org.jboss.netty.channel.{Channel, ChannelEvent, ChannelHandlerContext, ChannelPipelineFactory, Channels, UpstreamMessageEvent}
+import com.twitter.util.{Closable, StorageUnit}
+import java.lang.{Long => JLong}
+import org.jboss.netty.channel._
+import org.jboss.netty.handler.codec.frame.TooLongFrameException
 import org.jboss.netty.handler.codec.http._
 
-private[finagle] case class BadHttpRequest(
-  httpVersion: HttpVersion, method: HttpMethod, uri: String, exception: Exception)
-  extends DefaultHttpRequest(httpVersion, method, uri)
+/**
+ * a HttpChunkAggregator which recovers decode failures into 4xx http responses
+ */
+private[http] class SafeServerHttpChunkAggregator(maxContentSizeBytes: Int) extends HttpChunkAggregator(maxContentSizeBytes) {
 
-object BadHttpRequest {
-  def apply(exception: Exception) =
-    new BadHttpRequest(HttpVersion.HTTP_1_0, HttpMethod.GET, "/bad-http-request", exception)
+  override def handleUpstream(ctx: ChannelHandlerContext, e: ChannelEvent): Unit = {
+    try super.handleUpstream(ctx, e)
+    catch { case ex: TooLongFrameException =>
+      val event = BadMessageConverter.errorToDownstreamEvent(ctx.getChannel, ex)
+      ctx.sendDownstream(event)
+    }
+  }
 }
 
 /** Convert exceptions to BadHttpRequests */
-class SafeHttpServerCodec(
+private[http] class SafeHttpServerCodec(
     maxInitialLineLength: Int,
     maxHeaderSize: Int,
     maxChunkSize: Int)
@@ -32,13 +43,13 @@ class SafeHttpServerCodec(
     // this only catches Codec exceptions -- when a handler calls sendUpStream(), it
     // rescues exceptions from the upstream handlers and calls notifyHandlerException(),
     // which doesn't throw exceptions.
-    try {
-     super.handleUpstream(ctx, e)
-    } catch {
-      case ex: Exception =>
-        val channel = ctx.getChannel()
-        ctx.sendUpstream(new UpstreamMessageEvent(
-          channel, BadHttpRequest(ex), channel.getRemoteAddress()))
+    try super.handleUpstream(ctx, e)
+    catch { case ex: Exception =>
+      val event = BadMessageConverter.errorToDownstreamEvent(ctx.getChannel, ex)
+      
+      // The event must be handled by `this` because we are the codec
+      // responsible for handling http messages
+      this.handleDownstream(ctx, event)
     }
   }
 }
@@ -113,6 +124,7 @@ case class Http(
   def maxRequestSize(bufferSize: StorageUnit) = copy(_maxRequestSize = bufferSize)
   def maxResponseSize(bufferSize: StorageUnit) = copy(_maxResponseSize = bufferSize)
   def decompressionEnabled(yesno: Boolean) = copy(_decompressionEnabled = yesno)
+  @deprecated("Use maxRequestSize to enforce buffer footprint limits", "2016-05-10")
   def channelBufferUsageTracker(usageTracker: ChannelBufferUsageTracker) =
     copy(_channelBufferUsageTracker = Some(usageTracker))
   def annotateCipherHeader(headerName: String) = copy(_annotateCipherHeader = Option(headerName))
@@ -130,13 +142,15 @@ case class Http(
           val maxHeaderSizeInBytes = _maxHeaderSize.inBytes.toInt
           val maxChunkSize = 8192
           pipeline.addLast(
-            "httpCodec", new HttpClientCodec(
+            HttpCodecName, new HttpClientCodec(
               maxInitialLineLengthInBytes, maxHeaderSizeInBytes, maxChunkSize))
 
-          if (!_streaming)
+          if (!_streaming) {
             pipeline.addLast(
               "httpDechunker",
               new HttpChunkAggregator(_maxResponseSize.inBytes.toInt))
+            pipeline.addLast("clientExceptionMapper", ClientExceptionMapper)
+          }
 
           if (_decompressionEnabled)
             pipeline.addLast("httpDecompressor", new HttpContentDecompressor)
@@ -151,27 +165,39 @@ case class Http(
         underlying.map(new DelayedReleaseService(_))
 
       override def prepareConnFactory(
-        underlying: ServiceFactory[Request, Response]
+        underlying: ServiceFactory[Request, Response],
+        params: Stack.Params
       ): ServiceFactory[Request, Response] =
         // Note: This is a horrible hack to ensure that close() calls from
         // ExpiringService do not propagate until all chunks have been read
         // Waiting on CSL-915 for a proper fix.
-        underlying.map(u =>
-          (new ClientContextFilter[Request, Response])
-            .andThen(new DelayedReleaseService(u)))
+        underlying.map { u =>
+          val filters =
+            new ClientContextFilter[Request, Response]
+              .andThen(new DtabFilter.Injector)
+              .andThenIf(!_streaming ->
+                new PayloadSizeFilter[Request, Response](
+                  params[finagle.param.Stats].statsReceiver, _.content.length, _.content.length
+                )
+              )
+
+          filters.andThen(new DelayedReleaseService(u))
+        }
 
       override def newClientTransport(ch: Channel, statsReceiver: StatsReceiver): Transport[Any,Any] =
-        new HttpTransport(super.newClientTransport(ch, statsReceiver))
+        super.newClientTransport(ch, statsReceiver)
 
       override def newClientDispatcher(transport: Transport[Any, Any], params: Stack.Params) =
         new HttpClientDispatcher(
-          transport,
-          params[param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
+          new HttpTransport(new Netty3ClientStreamTransport(transport)),
+          params[finagle.param.Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
         )
 
       override def newTraceInitializer =
         if (_enableTracing) new HttpClientTraceInitializer[Request, Response]
         else TraceInitializerFilter.empty[Request, Response]
+
+      override def protocolLibraryName: String = Http.this.protocolLibraryName
     }
   }
 
@@ -188,13 +214,21 @@ case class Http(
           val maxRequestSizeInBytes = _maxRequestSize.inBytes.toInt
           val maxInitialLineLengthInBytes = _maxInitialLineLength.inBytes.toInt
           val maxHeaderSizeInBytes = _maxHeaderSize.inBytes.toInt
-          pipeline.addLast("httpCodec", new SafeHttpServerCodec(maxInitialLineLengthInBytes, maxHeaderSizeInBytes, maxRequestSizeInBytes))
+          val safeCodec = new SafeHttpServerCodec(
+            maxInitialLineLengthInBytes,
+            maxHeaderSizeInBytes,
+            maxRequestSizeInBytes /* maxChunkSize */
+          )
+          pipeline.addLast(HttpCodecName, safeCodec)
 
           if (_compressionLevel > 0) {
             pipeline.addLast("httpCompressor", new HttpContentCompressor(_compressionLevel))
           } else if (_compressionLevel == -1) {
             pipeline.addLast("httpCompressor", new TextualContentCompressor)
           }
+
+          if (_decompressionEnabled)
+            pipeline.addLast("httpDecompressor", new HttpContentDecompressor)
 
           // The payload size handler should come before the RespondToExpectContinue handler so that we don't
           // send a 100 CONTINUE for oversize requests we have no intention of handling.
@@ -205,7 +239,7 @@ case class Http(
           if (!_streaming)
             pipeline.addLast(
               "httpDechunker",
-              new HttpChunkAggregator(maxRequestSizeInBytes))
+              new SafeServerHttpChunkAggregator(maxRequestSizeInBytes))
 
           _annotateCipherHeader foreach { headerName: String =>
             pipeline.addLast("annotateCipher", new AnnotateCipher(headerName))
@@ -218,15 +252,22 @@ case class Http(
       override def newServerDispatcher(
         transport: Transport[Any, Any],
         service: Service[Request, Response]
-      ): Closable =
-        new HttpServerDispatcher(new HttpTransport(transport), service)
+      ): Closable = new HttpServerDispatcher(
+        new HttpTransport(new Netty3ServerStreamTransport(transport)),
+        service,
+        ServerStatsReceiver)
 
       override def prepareConnFactory(
-        underlying: ServiceFactory[Request, Response]
+        underlying: ServiceFactory[Request, Response],
+        params: Stack.Params
       ): ServiceFactory[Request, Response] = {
-        (new HttpNackFilter(_statsReceiver))
-          .andThen(new DtabFilter.Finagle[Request])
+        val finagle.param.Stats(stats) = params[finagle.param.Stats]
+        new HttpNackFilter(stats)
+          .andThen(new DtabFilter.Extractor)
           .andThen(new ServerContextFilter[Request, Response])
+          .andThenIf(!_streaming -> new PayloadSizeFilter[Request, Response](
+            stats, _.content.length, _.content.length)
+          )
           .andThen(underlying)
       }
 
@@ -259,6 +300,10 @@ object HttpTracing {
 
     val All = Seq(TraceId, SpanId, ParentSpanId, Sampled, Flags)
     val Required = Seq(TraceId, SpanId)
+
+    /** exposed for testing */
+    private[http] def hasAllRequired(headers: HeaderMap): Boolean =
+      headers.contains(Header.TraceId) && headers.contains(Header.SpanId)
   }
 
   /** Java compatibility API for [[Header]]. */
@@ -278,39 +323,57 @@ object HttpTracing {
 private object TraceInfo {
   import HttpTracing._
 
+  private[this] def removeAllHeaders(headers: HeaderMap): Unit = {
+    val iter = Header.All.iterator
+    while (iter.hasNext)
+      headers -= iter.next()
+  }
+
   def letTraceIdFromRequestHeaders[R](request: Request)(f: => R): R = {
-    val id = if (Header.Required.forall { request.headers.contains(_) }) {
-      val spanId = SpanId.fromString(request.headers.get(Header.SpanId))
+    val id =
+      if (Header.hasAllRequired(request.headerMap)) {
+        val spanId = SpanId.fromString(request.headerMap(Header.SpanId))
 
-      spanId map { sid =>
-        val traceId = SpanId.fromString(request.headers.get(Header.TraceId))
-        val parentSpanId = SpanId.fromString(request.headers.get(Header.ParentSpanId))
+        spanId match {
+          case None => None
+          case Some(sid) =>
+            val traceId = SpanId.fromString(request.headerMap(Header.TraceId))
+            val parentSpanId =
+              if (request.headerMap.contains(Header.ParentSpanId))
+                SpanId.fromString(request.headerMap(Header.ParentSpanId))
+              else
+                None
 
-        val sampled = Option(request.headers.get(Header.Sampled)) flatMap { sampled =>
-          Try(sampled.toBoolean).toOption
+            val sampled = if (!request.headerMap.contains(Header.Sampled)) {
+              None
+            } else {
+              try Some(request.headerMap(Header.Sampled).toBoolean)
+              catch { case _: IllegalArgumentException =>
+                None
+              }
+            }
+
+            val flags = getFlags(request)
+            Some(TraceId(traceId, parentSpanId, sid, sampled, flags))
         }
-
-        val flags = getFlags(request)
-        TraceId(traceId, parentSpanId, sid, sampled, flags)
+      } else if (request.headerMap.contains(Header.Flags)) {
+        // even if there are no id headers we want to get the debug flag
+        // this is to allow developers to just set the debug flag to ensure their
+        // trace is collected
+        Some(Trace.nextId.copy(flags = getFlags(request)))
+      } else {
+        Some(Trace.nextId)
       }
-    } else if (request.headers.contains(Header.Flags)) {
-      // even if there are no id headers we want to get the debug flag
-      // this is to allow developers to just set the debug flag to ensure their
-      // trace is collected
-      Some(Trace.nextId.copy(flags = getFlags(request)))
-    } else {
-      Some(Trace.nextId)
-    }
 
     // remove so the header is not visible to users
-    Header.All foreach { request.headers.remove(_) }
+    removeAllHeaders(request.headerMap)
 
     id match {
-      case Some(id) =>
-        Trace.letId(id) {
-    traceRpc(request)
+      case Some(tid) =>
+        Trace.letId(tid) {
+          traceRpc(request)
           f
-  }
+        }
       case None =>
         traceRpc(request)
         f
@@ -318,27 +381,31 @@ private object TraceInfo {
   }
 
   def setClientRequestHeaders(request: Request): Unit = {
-    Header.All.foreach { request.headers.remove(_) }
+    removeAllHeaders(request.headerMap)
 
     val traceId = Trace.id
-    request.headers.add(Header.TraceId, traceId.traceId.toString)
-    request.headers.add(Header.SpanId, traceId.spanId.toString)
+    request.headerMap.add(Header.TraceId, traceId.traceId.toString)
+    request.headerMap.add(Header.SpanId, traceId.spanId.toString)
     // no parent id set means this is the root span
-    traceId._parentId.foreach { id =>
-      request.headers.add(Header.ParentSpanId, id.toString)
+    traceId._parentId match {
+      case Some(id) =>
+        request.headerMap.add(Header.ParentSpanId, id.toString)
+      case None => ()
     }
     // three states of sampled, yes, no or none (let the server decide)
-    traceId.sampled.foreach { sampled =>
-      request.headers.add(Header.Sampled, sampled.toString)
+    traceId.sampled match {
+      case Some(sampled) =>
+        request.headerMap.add(Header.Sampled, sampled.toString)
+      case None => ()
     }
-    request.headers.add(Header.Flags, traceId.flags.toLong)
+    request.headerMap.add(Header.Flags, JLong.toString(traceId.flags.toLong))
     traceRpc(request)
   }
 
   def traceRpc(request: Request): Unit = {
     if (Trace.isActivelyTracing) {
-      Trace.recordRpc(request.getMethod.getName)
-      Trace.recordBinary("http.uri", stripParameters(request.getUri))
+      Trace.recordRpc(request.method.toString)
+      Trace.recordBinary("http.uri", stripParameters(request.uri))
     }
   }
 
@@ -346,68 +413,53 @@ private object TraceInfo {
    * Safely extract the flags from the header, if they exist. Otherwise return empty flag.
    */
   def getFlags(request: Request): Flags = {
-    try {
-      Flags(Option(request.headers.get(Header.Flags)).map(_.toLong).getOrElse(0L))
-    } catch {
-      case _: Throwable => Flags()
+    if (!request.headerMap.contains(Header.Flags)) {
+      Flags()
+    } else {
+      try Flags(JLong.parseLong(request.headerMap(Header.Flags)))
+      catch {
+        case _: NumberFormatException => Flags()
+      }
     }
   }
 }
 
 private[finagle] class HttpServerTraceInitializer[Req <: Request, Rep]
-  extends Stack.Module1[param.Tracer, ServiceFactory[Req, Rep]] {
-  val role = TraceInitializerFilter.role
-  val description = "Initialize the tracing system with trace info from the incoming request"
+  extends Stack.Module1[finagle.param.Tracer, ServiceFactory[Req, Rep]] {
+  val role: Stack.Role = TraceInitializerFilter.role
+  val description: String =
+    "Initialize the tracing system with trace info from the incoming request"
 
-  def make(_tracer: param.Tracer, next: ServiceFactory[Req, Rep]) = {
-    val param.Tracer(tracer) = _tracer
+  def make(
+    _tracer: finagle.param.Tracer,
+    next: ServiceFactory[Req, Rep]
+  ): ServiceFactory[Req, Rep] = {
+    val finagle.param.Tracer(tracer) = _tracer
     val traceInitializer = Filter.mk[Req, Rep, Req, Rep] { (req, svc) =>
       Trace.letTracer(tracer) {
         TraceInfo.letTraceIdFromRequestHeaders(req) { svc(req) }
       }
     }
-    traceInitializer andThen next
+    traceInitializer.andThen(next)
   }
 }
 
 private[finagle] class HttpClientTraceInitializer[Req <: Request, Rep]
-  extends Stack.Module1[param.Tracer, ServiceFactory[Req, Rep]] {
-  val role = TraceInitializerFilter.role
-  val description = "Sets the next TraceId and attaches trace information to the outgoing request"
-  def make(_tracer: param.Tracer, next: ServiceFactory[Req, Rep]) = {
-    val param.Tracer(tracer) = _tracer
+  extends Stack.Module1[finagle.param.Tracer, ServiceFactory[Req, Rep]] {
+  val role: Stack.Role = TraceInitializerFilter.role
+  val description: String =
+    "Sets the next TraceId and attaches trace information to the outgoing request"
+  def make(
+    _tracer: finagle.param.Tracer,
+    next: ServiceFactory[Req, Rep]
+  ): ServiceFactory[Req, Rep] = {
+    val finagle.param.Tracer(tracer) = _tracer
     val traceInitializer = Filter.mk[Req, Rep, Req, Rep] { (req, svc) =>
       Trace.letTracerAndNextId(tracer) {
         TraceInfo.setClientRequestHeaders(req)
         svc(req)
       }
     }
-    traceInitializer andThen next
-  }
-}
-
-/**
- * Pass along headers with the required tracing information.
- */
-private[finagle] class HttpClientTracingFilter[Req <: Request, Res](serviceName: String)
-  extends SimpleFilter[Req, Res]
-{
-
-  def apply(request: Req, service: Service[Req, Res]) = {
-    TraceInfo.setClientRequestHeaders(request)
-    service(request)
-  }
-}
-
-/**
- * Adds tracing annotations for each http request we receive.
- * Including uri, when request was sent and when it was received.
- */
-private[finagle] class HttpServerTracingFilter[Req <: Request, Res](serviceName: String)
-  extends SimpleFilter[Req, Res]
-{
-  def apply(request: Req, service: Service[Req, Res]) =
-    TraceInfo.letTraceIdFromRequestHeaders(request) {
-    service(request)
+    traceInitializer.andThen(next)
   }
 }

@@ -1,6 +1,7 @@
-package com.twitter.finagle.exp.mysql
+package com.twitter.finagle.mysql
 
-import com.twitter.finagle.exp.mysql.transport.{Buffer, BufferReader, Packet}
+import com.twitter.finagle.mysql.transport.Packet
+import com.twitter.io.Buf
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
@@ -13,7 +14,7 @@ trait HexDump {
       .map(s => s.split(' ').filterNot(_ == ""))
     val asBytes = tokens.map(_.map(s =>
       ((s(0).asDigit << 4) + s(1).asDigit).toByte))
-    asBytes.map(arr => Packet(arr(3), Buffer(arr.drop(4))))
+    asBytes.map(arr => Packet(arr(3), Buf.ByteArray.Owned(arr.drop(4))))
   }
 }
 
@@ -100,7 +101,7 @@ class EofTest extends FunSuite with HexDump {
     assert(packets.size > 0)
     val eof = EOF.decode(packets(0))
     assert(eof.warnings == 0x00)
-    assert(eof.serverStatus == 0x02)
+    assert(eof.serverStatus.mask == 0x02)
   }
 }
 
@@ -166,4 +167,3 @@ class BinaryResultSetTest extends FunSuite with HexDump {
     }
   }
 }
-

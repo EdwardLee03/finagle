@@ -6,11 +6,10 @@ import com.twitter.finagle.client.{StackClient, StdStackClient, Transporter}
 import com.twitter.finagle.dispatch.SerialClientDispatcher
 import com.twitter.finagle.netty3.Netty3Transporter
 import com.twitter.finagle.netty3.transport.ChannelTransport
-import com.twitter.finagle.param.Stats
 import com.twitter.finagle.stats.{InMemoryStatsReceiver, StatsReceiver}
 import com.twitter.finagle.tracing.TraceInitializerFilter
 import com.twitter.finagle.transport.Transport
-import java.net.SocketAddress
+import java.net.{InetSocketAddress, SocketAddress}
 import org.jboss.netty.channel.{Channel, ChannelFactory, ChannelPipeline,
 ChannelPipelineFactory, Channels, DefaultChannelConfig}
 import org.mockito.Matchers._
@@ -30,7 +29,7 @@ trait IntegrationBase extends FunSuite with MockitoSugar {
     val statsReceiver = new InMemoryStatsReceiver
 
     val codec = mock[Codec[String, String]]
-    when(codec.prepareConnFactory(any[ServiceFactory[String, String]])) thenAnswer {
+    when(codec.prepareConnFactory(any[ServiceFactory[String, String]], any[Stack.Params])) thenAnswer {
       new Answer[ServiceFactory[String, String]] {
         def answer(invocation: InvocationOnMock): ServiceFactory[String, String] = {
           val arg = invocation.getArguments.head
@@ -68,7 +67,7 @@ trait IntegrationBase extends FunSuite with MockitoSugar {
     when(codec.failFastOk).thenReturn(true)
     when(codec.protocolLibraryName).thenReturn("fancy")
 
-    val clientAddress = new SocketAddress {}
+    val clientAddress = new InetSocketAddress(0)
 
     // Pipeline
     val clientPipelineFactory = mock[ChannelPipelineFactory]
@@ -98,7 +97,7 @@ trait IntegrationBase extends FunSuite with MockitoSugar {
     val clientBuilder = ClientBuilder()
       .name(name)
       .codec(codecFactory)
-      .channelFactory(channelFactory)
+      .configured(Netty3Transporter.ChannelFactory(channelFactory))
       .daemon(true) // don't create an exit guard
       .hosts(Seq(clientAddress))
       .reportTo(statsReceiver)
@@ -118,8 +117,8 @@ trait IntegrationBase extends FunSuite with MockitoSugar {
       type In = String
       type Out = String
 
-      def newTransporter(): Transporter[String, String] = {
-        Netty3Transporter[String, String](clientPipelineFactory, params)
+      def newTransporter(addr: SocketAddress): Transporter[String, String] = {
+        Netty3Transporter[String, String](clientPipelineFactory, addr, params)
       }
 
       def newDispatcher(transport: Transport[In, Out]): Service[String, String] =
@@ -131,7 +130,7 @@ trait IntegrationBase extends FunSuite with MockitoSugar {
       client.withStack(
         // needed for ClientBuilderTest.ClientBuilderHelper
         client.stack.replace(StackClient.Role.prepConn, (next: ServiceFactory[String, String]) =>
-          codec.prepareConnFactory(next)))
+          codec.prepareConnFactory(next, Stack.Params.empty)))
     }
   }
 }

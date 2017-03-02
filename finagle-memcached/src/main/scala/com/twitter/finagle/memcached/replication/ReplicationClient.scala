@@ -2,19 +2,16 @@ package com.twitter.finagle.memcached.replication
 
 import _root_.java.lang.{Boolean => JBoolean, Long => JLong}
 
-import scala.collection.JavaConversions._
-import scala.util.Random
-
 import com.twitter.conversions.time._
+import com.twitter.finagle.Addr
 import com.twitter.finagle.builder.{Cluster, ClientBuilder, ClientConfig}
-import com.twitter.finagle.cacheresolver.CacheNode
-import com.twitter.finagle.Group
+import com.twitter.finagle.{Name, Group}
 import com.twitter.finagle.memcached._
 import com.twitter.finagle.memcached.protocol.Value
-import com.twitter.finagle.memcached.util.ChannelBufferUtils._
 import com.twitter.finagle.stats.{StatsReceiver, NullStatsReceiver}
 import com.twitter.io.Buf
 import com.twitter.util._
+import scala.util.Random
 
 sealed trait ReplicationStatus[T]
 
@@ -45,6 +42,7 @@ case class SCasUnique(casUnique: Buf) extends ReplicaCasUnique
 /**
  * Replication client helper
  */
+@deprecated("Use BaseReplicationClient with clients created using `c.t.f.Memcached.client`", "2017-02-08")
 object ReplicationClient {
   def newBaseReplicationClient(
     pools: Seq[Cluster[CacheNode]],
@@ -53,8 +51,11 @@ object ReplicationClient {
     failureAccrualParams: (Int, () => Duration) = (5, () => 30.seconds)
   ) = {
     val underlyingClients = pools map { pool =>
-      Await.result(pool.ready)
-      KetamaClientBuilder(Group.fromCluster(pool), hashName, clientBuilder, failureAccrualParams).build()
+      val group = Group.fromCluster(pool)
+      // Must use `set` method on Group so we get updates
+      val va: Var[Addr] = group.set.map(_.map(CacheNode.toAddress)).map(Addr.Bound(_))
+      val name = Name.Bound.singleton(va)
+      KetamaClientBuilder(name, hashName, clientBuilder, failureAccrualParams).build()
     }
     val repStatsReceiver =
       clientBuilder map { _.statsReceiver.scope("cache_replication") } getOrElse(NullStatsReceiver)
@@ -75,6 +76,7 @@ object ReplicationClient {
  * Base replication client. This client manages a list of base memcached clients representing
  * cache replicas. All replication API returns ReplicationStatus object indicating the underlying
  * replicas consistency state.
+ *
  * @param clients list of memcached clients with each one representing to a single cache pool
  * @param statsReceiver
  */

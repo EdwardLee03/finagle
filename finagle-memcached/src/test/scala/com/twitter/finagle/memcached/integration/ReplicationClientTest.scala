@@ -5,9 +5,7 @@ import com.twitter.common.zookeeper.testing.ZooKeeperTestServer
 import com.twitter.common.zookeeper.{ServerSets, ZooKeeperClient, ZooKeeperUtils}
 import com.twitter.conversions.time._
 import com.twitter.finagle.builder.ClientBuilder
-import com.twitter.finagle.cacheresolver.{CachePoolCluster, CachePoolConfig}
-import com.twitter.finagle.memcached.{CasResult, KetamaClientBuilder}
-import com.twitter.finagle.memcached.protocol.text.Memcached
+import com.twitter.finagle.memcached.{CachePoolCluster, CachePoolConfig, CasResult, KetamaClientBuilder}
 import com.twitter.finagle.memcached.replication._
 import com.twitter.finagle.zookeeper.ZookeeperServerSetCluster
 import com.twitter.finagle.{Group, WriteException}
@@ -96,12 +94,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -147,12 +145,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -204,12 +202,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -256,12 +254,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -274,11 +272,18 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(client1.set("foo", Buf.Utf8("bar")))
     assert(Await.result(replicatedClient.getsAll("foo")) == ConsistentReplication(
       Some((Buf.Utf8("bar"), RCasUnique(Seq(Buf.Utf8("2"), Buf.Utf8("1")))))))
-    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Seq(Buf.Utf8("2"), Buf.Utf8("1")))) == ConsistentReplication(CasResult.Stored))
-    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Seq(Buf.Utf8("3"), Buf.Utf8("2")))) == ConsistentReplication(CasResult.Stored))
+    assert(
+      Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Seq(Buf.Utf8("2"), Buf.Utf8("1")))) ==
+        ConsistentReplication(CasResult.Stored))
+    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Seq(Buf.Utf8("3"), Buf.Utf8("2")))) ==
+      ConsistentReplication(CasResult.Stored))
     Await.result(client1.set("foo", Buf.Utf8("bar")))
     Await.result(client2.set("foo", Buf.Utf8("bar")))
-    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Seq(Buf.Utf8("4"), Buf.Utf8("3")))) == ConsistentReplication(CasResult.NotFound))
+
+    // We have modified "foo" since the last fetch (by setting "foo" on each client),
+    // so the CAS tokens don't match and we expect "EXISTS" to be returned from Memcached.
+    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Seq(Buf.Utf8("4"), Buf.Utf8("3"))))==
+      ConsistentReplication(CasResult.Exists))
     assert(Await.result(replicatedClient.delete("foo")) == ConsistentReplication(true))
     assert(Await.result(replicatedClient.getsAll("foo")) == ConsistentReplication(None))
 
@@ -291,13 +296,15 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     assert(Await.result(client1.delete("foo")) == true)
     assert(Await.result(replicatedClient.getsAll("foo")) == InconsistentReplication(
       Seq(Return(None), Return(Some((Buf.Utf8("baz"), SCasUnique(Buf.Utf8("5"))))))))
-    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("bar"), Seq(Buf.Utf8("7"), Buf.Utf8("5")))) match {
-      case InconsistentReplication(Seq(Throw(_), Return(CasResult.NotFound))) => true
-      case _ => false
-    })
+
+    // "foo" was not found on the first replica because we deleted it, so we expect NOT_FOUND
+    // "foo" was found on the second replica with matching CAS, so we expect STORED
+    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("bar"), Seq(Buf.Utf8("7"), Buf.Utf8("5")))) ==
+      InconsistentReplication(Seq(Return(CasResult.NotFound), Return(CasResult.Stored))))
+
     Await.result(client1.set("foo", Buf.Utf8("bar")))
-    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("bar"), Seq(Buf.Utf8("6"), Buf.Utf8("6")))) == InconsistentReplication(
-      Seq(Return(CasResult.Exists), Return(CasResult.Stored))))
+    assert(Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("bar"), Seq(Buf.Utf8("6"), Buf.Utf8("6")))) ==
+      InconsistentReplication(Seq(Return(CasResult.Exists), Return(CasResult.Stored))))
 
     // inconsistent replica state
     firstTestServerPool(0).stop()
@@ -334,12 +341,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -403,12 +410,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -464,12 +471,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -514,12 +521,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -563,12 +570,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -592,12 +599,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -648,12 +655,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -671,13 +678,15 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     assert(Await.result(replicatedClient.gets("inconsistent-key")) == None)
 
     // cas overwrites existing data
-    assert(Await.result(replicatedClient.cas("foo", Buf.Utf8("baz"), Buf.Utf8("1|1"))) == true)
+    assert(Await.result(
+      replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Buf.Utf8("1|1"))
+        .map(_.replaced)))
 
     // inconsistent replica state
     firstTestServerPool(0).stop()
     firstTestServerPool(1).stop()
     intercept[SimpleReplicationFailure] {
-      Await.result(replicatedClient.cas("foo", Buf.Utf8("baz"), Buf.Utf8("2|3")))
+      Await.result(replicatedClient.checkAndSet("foo", Buf.Utf8("baz"), Buf.Utf8("2|3")))
     }
     intercept[SimpleReplicationFailure] {
       Await.result(replicatedClient.gets("foo"))
@@ -693,12 +702,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -746,12 +755,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -797,12 +806,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -840,12 +849,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -885,12 +894,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
@@ -929,12 +938,12 @@ class ReplicationClientTest extends FunSuite with BeforeAndAfterEach {
     Await.result(mycluster2.ready) // give it sometime for the cluster to get the initial set of memberships
 
     val client1 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster1))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()
     val client2 = KetamaClientBuilder()
-        .clientBuilder(ClientBuilder().hostConnectionLimit(1).codec(Memcached()).failFast(false))
+        .clientBuilder(ClientBuilder().hostConnectionLimit(1).failFast(false))
         .group(Group.fromCluster(mycluster2))
         .failureAccrualParams(Int.MaxValue, 0.seconds)
         .build()

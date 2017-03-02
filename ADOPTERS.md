@@ -12,8 +12,11 @@ URLs if possible) and [submit a pull request][1]!
 * [Buoyant](http://buoyant.io/)
 * [Chartboost](https://www.chartboost.com/)
 * [Crimson Hexagon](http://www.crimsonhexagon.com/)
+* [Criteo](http://www.criteo.com/)
 * [Despegar](http://www.despegar.com/)
 * [DICE](http://dice.se/)
+* [Dwango](http://dwango.co.jp/)
+* [EnerNOC](https://www.enernoc.com/)
 * [Foursquare](https://foursquare.com/)
 * [Gigya](https://www.gigya.com/)
 * [Globo.com](http://globo.com/)
@@ -28,6 +31,7 @@ URLs if possible) and [submit a pull request][1]!
 * [National Center for Biotechnology Information (NCBI)](https://www.ncbi.nlm.nih.gov/)
 * [Nest](https://nest.com/)
 * The [New York Times](http://www.nytimes.com/)
+* [Nubank](https://www.nubank.com.br/)
 * [OpenAura](http://openaura.com/)
 * [OrchardPlatform](https://orchardplatform.com/)
 * [PagerDuty](https://www.pagerduty.com/)
@@ -41,6 +45,7 @@ URLs if possible) and [submit a pull request][1]!
   * [Thor, a Finagle-based image processor][4]
 * [Reputation.com](https://www.reputation.com/)
 * [Sabre Labs](http://sabrelabs.com/)
+* [Salesforce](https://www.salesforce.com/)
 * [Sharethrough](https://www.sharethrough.com/)
   * ["Finagle @ Sharethrough: Twitter #Conf Presentation"][5]
 * [SmartNews](https://www.smartnews.com/en/)

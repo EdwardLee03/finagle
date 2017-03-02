@@ -1,17 +1,17 @@
 package com.twitter.finagle.kestrel
 
-import scala.collection.JavaConversions._
-
 import com.twitter.concurrent.{Offer, Broker}
 import com.twitter.conversions.time._
 import com.twitter.finagle.kestrel.protocol._
 import com.twitter.finagle.builder.ClientBuilder
-import com.twitter.finagle.{ServiceFactory, Service}
+import com.twitter.finagle.{Kestrel, ServiceFactory, Service}
 import com.twitter.finagle.thrift.ThriftClientRequest
 import com.twitter.finagle.kestrel.net.lag.kestrel.thriftscala.Item
 import com.twitter.finagle.kestrel.net.lag.kestrel.thriftscala.Kestrel.FinagledClient
 import com.twitter.io.Buf
 import com.twitter.util.{Command=>_, _}
+import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
 
 /**
  * Indicates that a [[com.twitter.finagle.kestrel.ReadHandle]] has been closed.
@@ -159,7 +159,7 @@ object ReadHandle {
    * A java-friendly interface to {{merged}}
    */
   def merged(handles: _root_.java.util.Iterator[ReadHandle]): ReadHandle =
-    merged(handles.toSeq)
+    merged(handles.asScala.toSeq)
 }
 
 object Client {
@@ -169,7 +169,7 @@ object Client {
 
   def apply(hosts: String): Client = {
     val service = ClientBuilder()
-      .codec(Kestrel())
+      .stack(Kestrel.client)
       .hosts(hosts)
       .hostConnectionLimit(1)
       .daemon(true)
@@ -333,7 +333,7 @@ abstract protected[kestrel] class CommandExecutorFactory[U]
  * @tparam ItemId the type used by {{CommandExecutor}} to identify returned
  *                items
  */
-abstract protected[kestrel] class ClientBase[CommandExecutor <: Closable, Reply, ItemId](
+abstract protected[kestrel] class ClientBase[CommandExecutor <: Closable, Reply: ClassTag, ItemId](
     underlying: CommandExecutorFactory[CommandExecutor])
   extends Client
 {
@@ -557,7 +557,7 @@ protected[kestrel] class ThriftConnectedClient(underlying: FinagledClientFactory
   def set(queueName: String, value: Buf, expiry: Time = Time.epoch): Future[Response] = {
     val timeout = safeLongToInt(expiry.inMilliseconds)
     withClient[Response](client =>
-      client.put(queueName, List(Buf.toByteBuffer(value)), timeout).map {
+      client.put(queueName, List(Buf.ByteBuffer.Owned.extract(value)), timeout).map {
         _ => Stored()
       })
   }
@@ -567,7 +567,7 @@ protected[kestrel] class ThriftConnectedClient(underlying: FinagledClientFactory
     withClient[Option[Buf]](client =>
       client.get(queueName, 1, waitUpToMsec).map {
         case Seq() => None
-        case Seq(item: Item) => Some(Buf.ByteBuffer(item.data))
+        case Seq(item: Item) => Some(Buf.ByteBuffer.Owned(item.data))
         case _ => throw new IllegalArgumentException
       })
   }
@@ -592,7 +592,7 @@ protected[kestrel] class ThriftConnectedClient(underlying: FinagledClientFactory
   def read(queueName: String): ReadHandle =
     read(
       (response: Seq[Item]) => response match {
-        case Seq(Item(data, id)) => Return(Some((Buf.ByteBuffer(data), id)))
+        case Seq(Item(data, id)) => Return(Some((Buf.ByteBuffer.Owned(data), id)))
         case Seq() => Return(None)
         case _ => Throw(new IllegalArgumentException("invalid reply from kestrel"))
       },

@@ -1,13 +1,13 @@
 #!/bin/bash
 
-sbtver=0.13.8
+sbtver=0.13.9
 sbtjar=sbt-launch.jar
-sbtsha128=57d0f04f4b48b11ef7e764f4cea58dee4e806ffd
+sbtsha128=1de48c2c412fffc4336e4d7dee224927a96d5abc
 
 sbtrepo=http://repo.typesafe.com/typesafe/ivy-releases/org.scala-sbt/sbt-launch
 
 if [ ! -f $sbtjar ]; then
-  echo "downloading $sbtjar" 1>&2
+  echo "downloading $PWD/$sbtjar" 1>&2
   if ! curl --location --silent --fail --remote-name $sbtrepo/$sbtver/$sbtjar; then
     exit 1
   fi
@@ -15,12 +15,13 @@ fi
 
 checksum=`openssl dgst -sha1 $sbtjar | awk '{ print $2 }'`
 if [ "$checksum" != $sbtsha128 ]; then
-  echo "bad $sbtjar.  delete $sbtjar and run $0 again."
+  echo "bad $PWD/$sbtjar.  delete $PWD/$sbtjar and run $0 again."
   exit 1
 fi
 
 [ -f ~/.sbtconfig ] && . ~/.sbtconfig
 
+# the -DSKIP_SBT flag is set to skip tests that shouldn't be run with sbt.
 java -ea                          \
   $SBT_OPTS                       \
   $JAVA_OPTS                      \
@@ -31,11 +32,11 @@ java -ea                          \
   -XX:+CMSParallelRemarkEnabled   \
   -XX:+CMSClassUnloadingEnabled   \
   -XX:ReservedCodeCacheSize=128m  \
-  -XX:MaxPermSize=1024m           \
   -XX:SurvivorRatio=128           \
   -XX:MaxTenuringThreshold=0      \
   -Xss8M                          \
   -Xms512M                        \
   -Xmx2G                          \
+  -DSKIP_SBT=1                    \
   -server                         \
   -jar $sbtjar "$@"

@@ -1,12 +1,15 @@
 package com.twitter.finagle.http.codec
 
 import com.twitter.concurrent.AsyncQueue
-import com.twitter.finagle.{Dtab, Status}
+import com.twitter.finagle.http.filter.HttpNackFilter
+import com.twitter.finagle.{Address, Http, Name, Service, Status, http}
 import com.twitter.finagle.http.{Request, Response}
-import com.twitter.finagle.http.netty.Bijections._
-import com.twitter.finagle.transport.{Transport, QueueTransport}
+import com.twitter.finagle.http.netty.{Bijections, Netty3ClientStreamTransport}
+import com.twitter.finagle.stats.{InMemoryStatsReceiver, NullStatsReceiver}
+import com.twitter.finagle.transport.{QueueTransport, Transport}
 import com.twitter.io.{Buf, Reader}
-import com.twitter.util.{Await, Duration, Time, Promise, Future, Return, Throw}
+import com.twitter.util.{Await, Closable, Duration, Future, Promise, Return, Throw, Time}
+import java.net.InetSocketAddress
 import org.jboss.netty.buffer.ChannelBuffers
 import org.jboss.netty.handler.codec.http._
 import org.jboss.netty.handler.codec.http.HttpResponseStatus.OK
@@ -27,11 +30,9 @@ object OpTransport {
 
 }
 
-class OpTransport[In, Out](_ops: List[OpTransport.Op[In, Out]]) extends Transport[In, Out] {
+class OpTransport[In, Out](var ops: List[OpTransport.Op[In, Out]]) extends Transport[In, Out] {
   import org.scalatest.Assertions._
   import OpTransport._
-
-  var ops = _ops
 
   def read() = ops match {
     case Read(res) :: rest =>
@@ -40,18 +41,18 @@ class OpTransport[In, Out](_ops: List[OpTransport.Op[In, Out]]) extends Transpor
     case _ =>
       fail(s"Expected ${ops.headOption}; got read()")
   }
-  
+
   def write(in: In) = ops match {
     case Write(accept, res) :: rest =>
       if (!accept(in))
         fail(s"Did not accept write $in")
-      
+
       ops = rest
       res
     case _ =>
       fail(s"Expected ${ops.headOption}; got write($in)")
   }
-  
+
   def close(deadline: Time) = ops match {
     case Close(res) :: rest =>
       ops = rest
@@ -75,21 +76,22 @@ class OpTransport[In, Out](_ops: List[OpTransport.Op[In, Out]]) extends Transpor
 
 @RunWith(classOf[JUnitRunner])
 class HttpClientDispatcherTest extends FunSuite {
-  def mkPair[A,B] = {
-    val inQ = new AsyncQueue[A]
-    val outQ = new AsyncQueue[B]
-    (new QueueTransport[A,B](inQ, outQ), new QueueTransport[B,A](outQ, inQ))
+  def mkPair() = {
+    val inQ = new AsyncQueue[Any]
+    val outQ = new AsyncQueue[Any]
+    (new Netty3ClientStreamTransport(new QueueTransport[Any, Any](inQ, outQ)),
+      new QueueTransport[Any, Any](outQ, inQ))
   }
 
   def chunk(content: String) =
     new DefaultHttpChunk(
       ChannelBuffers.wrappedBuffer(content.getBytes("UTF-8")))
 
-  private val timeout = Duration.fromSeconds(2)
+  private val timeout = Duration.fromSeconds(15)
 
   test("streaming request body") {
-    val (in, out) = mkPair[Any,Any]
-    val disp = new HttpClientDispatcher(in)
+    val (in, out) = mkPair()
+    val disp = new HttpClientDispatcher(in, NullStatsReceiver)
     val req = Request()
     req.setChunked(true)
     val f = disp(req)
@@ -98,7 +100,7 @@ class HttpClientDispatcherTest extends FunSuite {
     // discard the request immediately
     out.read()
 
-    val r = Response().httpResponse
+    val r = Bijections.responseToNetty(Response())
     r.setChunked(true)
     out.write(r)
     val res = Await.result(f, timeout)
@@ -123,27 +125,27 @@ class HttpClientDispatcherTest extends FunSuite {
   }
 
   test("invalid message") {
-    val (in, out) = mkPair[Any,Any]
-    val disp = new HttpClientDispatcher(in)
+    val (in, out) = mkPair()
+    val disp = new HttpClientDispatcher(in, NullStatsReceiver)
     out.write("invalid message")
-    intercept[IllegalArgumentException] { Await.result(disp(Request())) }
+    intercept[ClassCastException] { Await.result(disp(Request())) }
   }
 
   test("not chunked") {
-    val (in, out) = mkPair[Any,Any]
-    val disp = new HttpClientDispatcher(in)
+    val (in, out) = mkPair()
+    val disp = new HttpClientDispatcher(in, NullStatsReceiver)
     val httpRes = new DefaultHttpResponse(HTTP_1_1, OK)
     val req = Request()
     val f = disp(req)
     Await.result(out.read(), timeout)
     out.write(httpRes)
     val res = Await.result(f, timeout)
-    assert(res.httpResponse === httpRes)
+    assert(Bijections.responseToNetty(res) == httpRes)
   }
 
   test("chunked") {
-    val (in, out) = mkPair[Any,Any]
-    val disp = new HttpClientDispatcher(in)
+    val (in, out) = mkPair()
+    val disp = new HttpClientDispatcher(in, NullStatsReceiver)
     val httpRes = new DefaultHttpResponse(HTTP_1_1, OK)
     httpRes.setChunked(true)
 
@@ -153,20 +155,20 @@ class HttpClientDispatcherTest extends FunSuite {
 
     val c = reader.read(Int.MaxValue)
     out.write(chunk("hello"))
-    assert(Await.result(c, timeout) === Some(Buf.Utf8("hello")))
+    assert(Await.result(c, timeout) == Some(Buf.Utf8("hello")))
 
     val cc = reader.read(Int.MaxValue)
     out.write(chunk("world"))
-    assert(Await.result(cc, timeout) === Some(Buf.Utf8("world")))
+    assert(Await.result(cc, timeout) == Some(Buf.Utf8("world")))
 
     out.write(HttpChunk.LAST_CHUNK)
     assert(Await.result(reader.read(Int.MaxValue), timeout).isEmpty)
   }
 
   test("error mid-chunk") {
-    val (in, out) = mkPair[Any,Any]
+    val (in, out) = mkPair()
     val inSpy = spy(in)
-    val disp = new HttpClientDispatcher(inSpy)
+    val disp = new HttpClientDispatcher(inSpy, NullStatsReceiver)
     val httpRes = new DefaultHttpResponse(HTTP_1_1, OK)
     httpRes.setChunked(true)
 
@@ -176,7 +178,7 @@ class HttpClientDispatcherTest extends FunSuite {
 
     val c = reader.read(Int.MaxValue)
     out.write(chunk("hello"))
-    assert(Await.result(c, timeout) === Some(Buf.Utf8("hello")))
+    assert(Await.result(c, timeout) == Some(Buf.Utf8("hello")))
 
     val cc = reader.read(Int.MaxValue)
     out.write("something else")
@@ -188,11 +190,13 @@ class HttpClientDispatcherTest extends FunSuite {
     import OpTransport._
 
     val writep = new Promise[Unit]
+    val readp = new Promise[Unit]
     val transport = OpTransport[Any, Any](
       Write(Function.const(true), writep),
+      Read(readp),
       Close(Future.Done))
 
-    val disp = new HttpClientDispatcher(transport)
+    val disp = new HttpClientDispatcher(new Netty3ClientStreamTransport(transport), NullStatsReceiver)
     val req = Request()
     req.setChunked(true)
 
@@ -211,19 +215,19 @@ class HttpClientDispatcherTest extends FunSuite {
     assert(g.isDefined)
     intercept[Reader.ReaderDiscarded] { Await.result(g, timeout) }
   }
-  
+
   test("upstream interrupt: during req stream (read)") {
     import OpTransport._
-    
+
     val readp = new Promise[Nothing]
     val transport = OpTransport[Any, Any](
-      // First write the initial request.
+      // Write the initial request.
       Write(_.isInstanceOf[HttpRequest], Future.Done),
       // Read the response
       Read(readp),
       Close(Future.Done))
 
-    val disp = new HttpClientDispatcher(transport)
+    val disp = new HttpClientDispatcher(new Netty3ClientStreamTransport(transport), NullStatsReceiver)
     val req = Request()
     req.setChunked(true)
 
@@ -236,19 +240,19 @@ class HttpClientDispatcherTest extends FunSuite {
     // Simulate what a real transport would do:
     assert(transport.ops.isEmpty)
     readp.setException(new Exception)
-    
+
     // The reader is now discarded
-    intercept[Reader.ReaderDiscarded] { 
+    intercept[Reader.ReaderDiscarded] {
       Await.result(req.writer.write(Buf.Utf8(".")), timeout)
     }
   }
-  
+
   test("upstream interrupt: during req stream (write)") {
     import OpTransport._
-    
+
     val chunkp = new Promise[Unit]
     val transport = OpTransport[Any, Any](
-      // First write the initial request.
+      // Write the initial request.
       Write(_.isInstanceOf[HttpRequest], Future.Done),
       // Read the response
       Read(Future.never),
@@ -256,7 +260,7 @@ class HttpClientDispatcherTest extends FunSuite {
       Write(_.isInstanceOf[HttpChunk], chunkp),
       Close(Future.Done))
 
-    val disp = new HttpClientDispatcher(transport)
+    val disp = new HttpClientDispatcher(new Netty3ClientStreamTransport(transport), NullStatsReceiver)
     val req = Request()
     req.setChunked(true)
 
@@ -272,120 +276,84 @@ class HttpClientDispatcherTest extends FunSuite {
     // Simulate what a real transport would do:
     assert(transport.ops.isEmpty)
     chunkp.setException(new Exception)
-    
+
     // The reader is now discarded
-    intercept[Reader.ReaderDiscarded] { 
+    intercept[Reader.ReaderDiscarded] {
       Await.result(req.writer.write(Buf.Utf8(".")), timeout)
     }
   }
 
-  test("ensure denial of new-style dtab headers") {
-    // create a test dispatcher and its transport mechanism
-    val (in, out) = mkPair[Any,Any]
-    val dispatcher = new HttpClientDispatcher(in)
+  test("swallows the body of a HttpNack if it happens to come as a chunked response") {
+    new NackCtx {
+      def nackBody: Buf = Buf.Utf8("Chunked nack body")
 
-    // prepare a request and add a correct looking new-style dtab header
-    val sentRequest = Request()
-    sentRequest.headers().add("dtab-local", "/srv=>/srv#/staging")
+      assert(Await.result(client(request), timeout).status == http.Status.Ok)
+      assert(serverSr.counters(Seq("myservice", "nacks")) == 1)
+      assert(clientSr.counters(Seq("http", "retries", "requeues")) == 1)
 
-    // dispatch the request
-    val futureResult = dispatcher(sentRequest)
+      // reuse connections
+      assert(Await.result(client(request), timeout).status == http.Status.Ok)
+      assert(clientSr.counters(Seq("http", "connects")) == 1)
+      assert(serverSr.counters(Seq("myservice", "nacks")) == 1)
 
-    // get the netty request out of the other end of the transporter
-    val recvNettyReq = Await.result(out.read()).asInstanceOf[HttpRequest]
-
-    // apply the bijection to convert the netty request to a finagle one
-    val recvFinagleReq = from[HttpRequest, Request](recvNettyReq)
-
-    // extract the dtab from the sent request
-    val recvDtab = HttpDtab.read(recvFinagleReq).get()
-
-    // send back an http ok to the dispatcher
-    val sentResult = new DefaultHttpResponse(HTTP_1_1, OK)
-    out.write(sentResult)
-
-    // block until the dispatcher presents us with the result
-    val recvResult = Await.result(futureResult, timeout)
-
-    // ensure that no dtabs were received
-    assert(recvDtab.length == 0)
-
-    // ensure that the sent and received http requests are identical
-    assert(recvResult.httpResponse == sentResult)
-  }
-
-  test("ensure denial of old-style dtab headers") {
-    // create a test dispatcher and its transport mechanism
-    val (in, out) = mkPair[Any,Any]
-    val dispatcher = new HttpClientDispatcher(in)
-
-    // prepare a request and add a correct looking new-style dtab header
-    val sentRequest = Request()
-    sentRequest.headers().add("x-dtab-00-a", "/s/foo")
-    sentRequest.headers().add("x-dtab-00-b", "/s/bar")
-
-    // dispatch the request
-    val futureResult = dispatcher(sentRequest)
-
-    // get the netty request out of the other end of the transporter
-    val recvNettyReq = Await.result(out.read()).asInstanceOf[HttpRequest]
-
-    // apply the bijection to convert the netty request to a finagle one
-    val recvFinagleReq = from[HttpRequest, Request](recvNettyReq)
-
-    // extract the dtab from the sent request
-    val recvDtab = HttpDtab.read(recvFinagleReq).get()
-
-    // send back an http ok to the dispatcher
-    val sentResult = new DefaultHttpResponse(HTTP_1_1, OK)
-    out.write(sentResult)
-
-    // block until the dispatcher presents us with the result
-    val recvResult = Await.result(futureResult, timeout)
-
-    // ensure that no dtabs were received
-    assert(recvDtab.length == 0)
-
-    // ensure that the sent and received http requests are identical
-    assert(recvResult.httpResponse == sentResult)
-  }
-
-  test("ensure transmission of dtab local") {
-    Dtab.unwind {
-      // create a test dispatcher and its transport mechanism
-      val (in, out) = mkPair[Any,Any]
-      val dispatcher = new HttpClientDispatcher(in)
-
-      // prepare a request and a simple dtab with one dentry
-      val sentRequest = Request()
-      val sentDtab = Dtab.read("/s => /srv/smf1")
-
-      // augment dtab.local and dispatch the request
-      Dtab.local ++= sentDtab
-      val futureResult = dispatcher(sentRequest)
-
-      // get the netty request out of the other end of the transporter
-      val recvNettyReq = Await.result(out.read()).asInstanceOf[HttpRequest]
-
-      // apply the bijection to convert the netty request to a finagle one
-      val recvFinagleReq = from[HttpRequest, Request](recvNettyReq)
-
-      // extract the dtab from the sent request
-      val recvDtab = HttpDtab.read(recvFinagleReq).get()
-
-      // send back an http ok to the dispatcher
-      val sentResult = new DefaultHttpResponse(HTTP_1_1, OK)
-      out.write(sentResult)
-
-      // block until the dispatcher presents us with the result
-      val recvResult = Await.result(futureResult, timeout)
-
-      // ensure that the sent and received dtabs are identical
-      assert(sentDtab == recvDtab)
-
-      // ensure that the sent and received http requests are identical
-      assert(recvResult.httpResponse == sentResult)
+      Closable.all(client, server).close()
     }
+  }
+
+  test("fails on excessively large nack response") {
+    new NackCtx {
+      def nackBody: Buf = Buf.Utf8("Very large" * 1024)
+
+      assert(Await.result(client(request), timeout).status == http.Status.Ok)
+
+      // Should have closed the connection on the first nack
+      assert(clientSr.counters(Seq("http", "connects")) == 2)
+      assert(serverSr.counters(Seq("myservice", "nacks")) == 1)
+
+      Closable.all(client, server).close()
+    }
+  }
+
+  // Scaffold for checking nack behavior
+  private abstract class NackCtx {
+    def nackBody: Buf
+    val serverSr = new InMemoryStatsReceiver
+    val clientSr = new InMemoryStatsReceiver
+    @volatile var needsNack = true
+    val service = Service.mk{ _: Request =>
+      val resp =
+        if (needsNack) {
+          needsNack = false
+          // simulate a nack response with a chunked body by just sending a chunked body
+          serverSr.scope("myservice").counter("nacks").incr()
+          val resp = Response(status = HttpNackFilter.ResponseStatus)
+          resp.headerMap.set(HttpNackFilter.RetryableNackHeader, "true")
+          resp.setChunked(true)
+          resp.writer.write(nackBody)
+            .before(resp.writer.close())
+          resp
+        } else {
+          val resp = Response()
+          resp.contentString = "the body"
+          resp
+        }
+
+      Future.value(resp)
+    }
+
+    val server =
+      Http.server
+        .withStatsReceiver(serverSr)
+        .withLabel("myservice")
+        .withStreaming(true)
+        .serve(new InetSocketAddress(0), service)
+    val client =
+      Http.client
+        .withStatsReceiver(clientSr)
+        .withStreaming(true)
+        .newService(Name.bound(Address(server.boundAddress.asInstanceOf[InetSocketAddress])), "http")
+
+    val request = Request("/")
   }
 }
 

@@ -1,17 +1,20 @@
 package com.twitter.finagle
 
-import com.twitter.finagle.client.{StdStackClient, StackClient, Transporter}
-import com.twitter.finagle.dispatch.{GenSerialClientDispatcher, SerialClientDispatcher, SerialServerDispatcher}
-import com.twitter.finagle.netty3.{Netty3Transporter, Netty3Listener}
-import com.twitter.finagle.param.{Monitor => _, ResponseClassifier => _, ExceptionStatsHandler => _, Tracer => _, _}
-import com.twitter.finagle.server.{StdStackServer, StackServer, Listener}
+import com.twitter.finagle.client.{ClientRegistry, StackClient, StdStackClient, Transporter}
+import com.twitter.finagle.dispatch.GenSerialClientDispatcher
+import com.twitter.finagle.param.{ExceptionStatsHandler => _, Monitor => _, ResponseClassifier => _, Tracer => _, _}
+import com.twitter.finagle.server.{Listener, ServerInfo, StackServer, StdStackServer}
 import com.twitter.finagle.service.{ResponseClassifier, RetryBudget}
 import com.twitter.finagle.stats.{ExceptionStatsHandler, StatsReceiver}
-import com.twitter.finagle.thrift.service.ThriftResponseClassifier
 import com.twitter.finagle.thrift.{ClientId => _, _}
+import com.twitter.finagle.thrift.service.ThriftResponseClassifier
+import com.twitter.finagle.thrift.transport.ThriftClientPreparer
+import com.twitter.finagle.thrift.transport.netty3.Netty3Transport
+import com.twitter.finagle.thrift.transport.netty4.Netty4Transport
+import com.twitter.finagle.toggle.Toggle
 import com.twitter.finagle.tracing.Tracer
 import com.twitter.finagle.transport.Transport
-import com.twitter.util.{Duration, Stopwatch, Monitor}
+import com.twitter.util.{Closable, Duration, Monitor}
 import java.net.SocketAddress
 import org.apache.thrift.protocol.TProtocolFactory
 
@@ -46,27 +49,109 @@ import org.apache.thrift.protocol.TProtocolFactory
  *
  * == Clients ==
  *
- * $clientExample
+ * Clients can be created directly from an interface generated from
+ * a Thrift IDL:
  *
- * $thriftUpgrade
+ * For example, this IDL:
+ *
+ * {{{
+ * service TestService {
+ *   string query(1: string x)
+ * }
+ * }}}
+ *
+ * compiled with Scrooge, generates the interface
+ * `TestService.FutureIface`. This is then passed
+ * into `Thrift.Client.newIface`:
+ *
+ * {{{
+ * Thrift.client.newIface[TestService.FutureIface](
+ *   addr, classOf[TestService.FutureIface])
+ * }}}
+ *
+ * However note that the Scala compiler can insert the latter
+ * `Class` for us, for which another variant of `newIface` is
+ * provided:
+ *
+ * {{{
+ * Thrift.client.newIface[TestService.FutureIface](addr)
+ * }}}
+ *
+ * In Java, we need to provide the class object:
+ *
+ * {{{
+ * TestService.FutureIface client =
+ *   Thrift.client.newIface(addr, TestService.FutureIface.class);
+ * }}}
+ *
+ * The client uses the standard thrift protocols, with support for
+ * both framed and buffered transports. Finagle attempts to upgrade
+ * the protocol in order to ship an extra envelope carrying trace IDs
+ * and client IDs associated with the request. These are used by
+ * Finagle's tracing facilities and may be collected via aggregators
+ * like [[http://twitter.github.com/zipkin/ Zipkin]].
+ *
+ * The negotiation is simple: on connection establishment, an
+ * improbably-named method is dispatched on the server. If that
+ * method isn't found, we are dealing with a legacy thrift server,
+ * and the standard protocol is used. If the remote server is also a
+ * finagle server (or any other supporting this extension), we reply
+ * to the request, and every subsequent request is dispatched with an
+ * envelope carrying trace metadata. The envelope itself is also a
+ * Thrift struct described [[https://github.com/twitter/finagle/blob/master/finagle-thrift/src/main/thrift/tracing.thrift here]].
  *
  * == Servers ==
  *
- * $serverExample
+ * `TestService.FutureIface` must be implemented and passed
+ * into `serveIface`:
  *
- * @define clientExampleObject Thrift
- * @define serverExampleObject Thrift
+ * {{{
+ * // An echo service
+ * ThriftMux.server.serveIface(":*", new TestService.FutureIface {
+ *   def query(x: String): Future[String] = Future.value(x)
+ * })
+ * }}}
  */
-object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichClient
-    with Server[Array[Byte], Array[Byte]] with ThriftRichServer {
+object Thrift
+  extends Client[ThriftClientRequest, Array[Byte]]
+  with Server[Array[Byte], Array[Byte]] {
+
+  /**
+   * The vanilla Thrift `Transporter` and `Listener` factories deviate from other protocols in
+   * the result of the netty pipeline: most other protocols expect to receive a framed `Buf`
+   * while vanilla thrift produces an `Array[Byte]`. This has two related motivations. First, the
+   * end result needed by the thrift implementations is an `Array[Byte]`, which is relatively
+   * trivial to deal with and is a JVM native type so it's unnecessary to go through a `Buf`.
+   * By avoiding an indirection through `Buf` we can avoid an unnecessary copy in the netty4
+   * pipeline that would be required to ensure that the bytes were on the heap before
+   * entering the Finagle transport types.
+   */
+  case class ThriftImpl(
+      transporter: Stack.Params => SocketAddress => Transporter[ThriftClientRequest, Array[Byte]],
+      listener: Stack.Params => Listener[Array[Byte], Array[Byte]]) {
+
+    def mk(): (ThriftImpl, Stack.Param[ThriftImpl]) = (this, ThriftImpl.param)
+
+  }
+
+  object ThriftImpl {
+    private[this] val UseNetty4ToggleId: String = "com.twitter.finagle.thrift.UseNetty4"
+    private[this] val netty4Toggle: Toggle[Int] = Toggles(UseNetty4ToggleId)
+    private[this] def useNetty4: Boolean = netty4Toggle(ServerInfo().id.hashCode)
+
+    val Netty3: ThriftImpl = ThriftImpl(Netty3Transport.Client, Netty3Transport.Server)
+    val Netty4: ThriftImpl = ThriftImpl(Netty4Transport.Client, Netty4Transport.Server)
+
+    implicit val param: Stack.Param[ThriftImpl] = Stack.Param(
+      if (useNetty4) Netty4
+      else Netty3
+    )
+  }
 
   val protocolFactory: TProtocolFactory = Protocols.binaryFactory()
 
-  protected lazy val Label(defaultClientName) = client.params[Label]
-
-  protected def params: Stack.Params = client.params
-
-  override protected lazy val Stats(stats) = client.params[Stats]
+  // Planned deprecation. Use `Thrift.Server.maxThriftBufferSize` instead.
+  val maxThriftBufferSize: Int = 16 * 1024
 
   object param {
     case class ClientId(clientId: Option[thrift.ClientId])
@@ -83,6 +168,7 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
      * A `Param` to control whether a framed transport should be used.
      * If this is set to false, a buffered transport is used.  Framed
      * transports are enabled by default.
+     *
      * @param enabled Whether a framed transport should be used.
      */
     case class Framed(enabled: Boolean)
@@ -91,50 +177,31 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     }
 
     /**
-     * A `Param` to set the max size of a reusable buffer for the thrift response.
-     * If the buffer size exceeds the specified value, the buffer is not reused,
-     * and a new buffer is used for the next thrift response.
-     * @param maxReusableBufferSize Max buffer size in bytes.
+     * A `Param` to control upgrading the thrift protocol to TTwitter.
+     *
+     * @see The [[https://twitter.github.io/finagle/guide/Protocols.html?highlight=Twitter-upgraded#thrift user guide]] for details on Twitter-upgrade Thrift.
      */
-    case class MaxReusableBufferSize(maxReusableBufferSize: Int)
-    implicit object MaxReusableBufferSize extends Stack.Param[MaxReusableBufferSize] {
-      val default = MaxReusableBufferSize(maxThriftBufferSize)
+    case class AttemptTTwitterUpgrade(upgrade: Boolean)
+    implicit object AttemptTTwitterUpgrade extends Stack.Param[AttemptTTwitterUpgrade] {
+      val default = AttemptTTwitterUpgrade(true)
     }
   }
 
   object Client {
     private val preparer: Stackable[ServiceFactory[ThriftClientRequest, Array[Byte]]] =
-      new Stack.Module4[
-        param.ClientId,
-        Label,
-        Stats,
-        param.ProtocolFactory,
-        ServiceFactory[ThriftClientRequest, Array[Byte]]
-      ] {
-        val role = StackClient.Role.prepConn
-        val description = "Prepare TTwitter thrift connection"
+      new Stack.ModuleParams[ServiceFactory[ThriftClientRequest, Array[Byte]]] {
+        override def parameters: Seq[Stack.Param[_]] = Nil
+        override val role: Stack.Role = StackClient.Role.prepConn
+        override val description = "Prepare TTwitter thrift connection"
         def make(
-          _clientId: param.ClientId,
-          _label: Label,
-          _stats: Stats,
-          _pf: param.ProtocolFactory,
+          params: Stack.Params,
           next: ServiceFactory[ThriftClientRequest, Array[Byte]]
-        ) = {
-          val Label(label) = _label
-          val param.ClientId(clientId) = _clientId
-          val param.ProtocolFactory(pf) = _pf
-          val preparer = new ThriftClientPreparer(pf, label, clientId)
-          val underlying = preparer.prepare(next)
-          val Stats(stats) = _stats
-          new ServiceFactoryProxy(underlying) {
-            val stat = stats.stat("codec_connection_preparation_latency_ms")
-            override def apply(conn: ClientConnection) = {
-              val elapsed = Stopwatch.start()
-              super.apply(conn) ensure {
-                stat.add(elapsed().inMilliseconds)
-              }
-            }
-          }
+        ): ServiceFactory[ThriftClientRequest, Array[Byte]] = {
+          val Label(label) = params[Label]
+          val param.ClientId(clientId) = params[param.ClientId]
+          val Thrift.param.ProtocolFactory(pf) = params[Thrift.param.ProtocolFactory]
+          val preparer = ThriftClientPreparer(pf, label, clientId)
+          preparer.prepare(next, params)
         }
       }
 
@@ -143,10 +210,17 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
       .replace(StackClient.Role.prepConn, preparer)
   }
 
+  /**
+   * A ThriftMux `com.twitter.finagle.Client`.
+   *
+   * @see [[http://twitter.github.io/finagle/guide/Configuration.html#clients-and-servers Configuration]] documentation
+   * @see [[http://twitter.github.io/finagle/guide/Protocols.html#thrift Thrift]] documentation
+   * @see [[http://twitter.github.io/finagle/guide/Protocols.html#mux Mux]] documentation
+   */
   case class Client(
-    stack: Stack[ServiceFactory[ThriftClientRequest, Array[Byte]]] = Client.stack,
-    params: Stack.Params = StackClient.defaultParams + ProtocolLibrary("thrift")
-  ) extends StdStackClient[ThriftClientRequest, Array[Byte], Client]
+      stack: Stack[ServiceFactory[ThriftClientRequest, Array[Byte]]] = Client.stack,
+      params: Stack.Params = StackClient.defaultParams + ProtocolLibrary("thrift"))
+    extends StdStackClient[ThriftClientRequest, Array[Byte], Client]
     with WithSessionPool[Client]
     with WithDefaultLoadBalancer[Client]
     with ThriftRichClient {
@@ -161,21 +235,16 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     protected type In = ThriftClientRequest
     protected type Out = Array[Byte]
 
-    val param.Framed(framed) = params[param.Framed]
     protected val param.ProtocolFactory(protocolFactory) = params[param.ProtocolFactory]
     override protected lazy val Stats(stats) = params[Stats]
 
-    protected def newTransporter(): Transporter[In, Out] = {
-      val pipeline =
-        if (framed) ThriftClientFramedPipelineFactory
-        else ThriftClientBufferedPipelineFactory(protocolFactory)
-      Netty3Transporter(pipeline, params)
-    }
+    protected def newTransporter(addr: SocketAddress): Transporter[In, Out] =
+      params[ThriftImpl].transporter(params)(addr)
 
     protected def newDispatcher(
       transport: Transport[ThriftClientRequest, Array[Byte]]
     ): Service[ThriftClientRequest, Array[Byte]] =
-      new SerialClientDispatcher(
+      new ThriftSerialClientDispatcher(
         transport,
         params[Stats].statsReceiver.scope(GenSerialClientDispatcher.StatsScope)
       )
@@ -184,9 +253,22 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
       configured(param.ProtocolFactory(protocolFactory))
 
     def withClientId(clientId: thrift.ClientId): Client =
-      configured(param.ClientId(Some(clientId)))
+      configured(Thrift.param.ClientId(Some(clientId)))
 
-    def clientId: Option[thrift.ClientId] = params[param.ClientId].clientId
+    /**
+     * Use a buffered transport instead of the default framed transport.
+     * In almost all cases, the default framed transport should be used.
+     */
+    def withBufferedTransport: Client =
+      configured(Thrift.param.Framed(false))
+
+    def withAttemptTTwitterUpgrade: Client =
+      configured(param.AttemptTTwitterUpgrade(true))
+
+    def withNoAttemptTTwitterUpgrade: Client =
+      configured(param.AttemptTTwitterUpgrade(false))
+
+    def clientId: Option[thrift.ClientId] = params[Thrift.param.ClientId].clientId
 
     private[this] def deserializingClassifier: Client = {
       // Note: what type of deserializer used is important if none is specified
@@ -212,8 +294,10 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     override def newClient(
       dest: Name,
       label: String
-    ): ServiceFactory[ThriftClientRequest, Array[Byte]] =
+    ): ServiceFactory[ThriftClientRequest, Array[Byte]] = {
+      clientId.foreach(id => ClientRegistry.export(params, "ClientId", id.name))
       deserializingClassifier.superNewClient(dest, label)
+    }
 
     // Java-friendly forwarders
     // See https://issues.scala-lang.org/browse/SI-8905
@@ -223,8 +307,8 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
       new DefaultLoadBalancingParams(this)
     override val withTransport: ClientTransportParams[Client] =
       new ClientTransportParams(this)
-    override val withSession: SessionParams[Client] =
-      new SessionParams(this)
+    override val withSession: ClientSessionParams[Client] =
+      new ClientSessionParams(this)
     override val withSessionQualifier: SessionQualificationParams[Client] =
       new SessionQualificationParams(this)
     override val withAdmissionControl: ClientAdmissionControlParams[Client] =
@@ -271,19 +355,34 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
 
   object Server {
     private val preparer =
-      new Stack.Module2[Label, param.ProtocolFactory, ServiceFactory[Array[Byte], Array[Byte]]]
-    {
-      val role = StackClient.Role.prepConn
-      val description = "Prepare TTwitter thrift connection"
-      def make(
-        _label: Label,
-        _pf: param.ProtocolFactory,
-        next: ServiceFactory[Array[Byte], Array[Byte]]
-      ) = {
-        val Label(label) = _label
-        val param.ProtocolFactory(pf) = _pf
-        val preparer = new thrift.ThriftServerPreparer(pf, label)
-        preparer.prepare(next)
+      new Stack.ModuleParams[ServiceFactory[Array[Byte], Array[Byte]]] {
+        override def parameters: Seq[Stack.Param[_]] = Nil
+        override val role: Stack.Role = StackClient.Role.prepConn
+        override val description = "Prepare TTwitter thrift connection"
+        def make(
+          params: Stack.Params,
+          next: ServiceFactory[Array[Byte], Array[Byte]]
+        ): ServiceFactory[Array[Byte], Array[Byte]] = {
+          val Label(label) = params[Label]
+          val Thrift.param.ProtocolFactory(pf) = params[Thrift.param.ProtocolFactory]
+          val preparer = ThriftServerPreparer(pf, label)
+          preparer.prepare(next, params)
+        }
+    }
+
+    val maxThriftBufferSize: Int = 16 * 1024
+
+    object param {
+      /**
+       * A `Param` to set the max size of a reusable buffer for the thrift response.
+       * If the buffer size exceeds the specified value, the buffer is not reused,
+       * and a new buffer is used for the next thrift response.
+       *
+       * @param maxReusableBufferSize Max buffer size in bytes.
+       */
+      case class MaxReusableBufferSize(maxReusableBufferSize: Int)
+      implicit object MaxReusableBufferSize extends Stack.Param[MaxReusableBufferSize] {
+        val default = MaxReusableBufferSize(maxThriftBufferSize)
       }
     }
 
@@ -291,6 +390,12 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
       .replace(StackServer.Role.preparer, preparer)
   }
 
+  /**
+   * A ThriftMux `com.twitter.finagle.Server`.
+   *
+   * @see [[http://twitter.github.io/finagle/guide/Configuration.html#clients-and-servers Configuration]] documentation
+   * @see [[http://twitter.github.io/finagle/guide/Protocols.html#thrift Thrift]] documentation
+   */
   case class Server(
     stack: Stack[ServiceFactory[Array[Byte], Array[Byte]]] = Server.stack,
     params: Stack.Params = StackServer.defaultParams + ProtocolLibrary("thrift")
@@ -303,23 +408,17 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     protected type In = Array[Byte]
     protected type Out = Array[Byte]
 
-    val param.Framed(framed) = params[param.Framed]
     protected val param.ProtocolFactory(protocolFactory) = params[param.ProtocolFactory]
 
-    protected def newListener(): Listener[In, Out] = {
-      val pipeline =
-        if (framed) thrift.ThriftServerFramedPipelineFactory
-        else thrift.ThriftServerBufferedPipelineFactory(protocolFactory)
+    override val Server.param.MaxReusableBufferSize(maxThriftBufferSize) =
+      params[Server.param.MaxReusableBufferSize]
 
-      Netty3Listener(pipeline,
-        if (params.contains[Label]) params else params + Label("thrift"))
-    }
+    protected def newListener(): Listener[In, Out] = params[ThriftImpl].listener(params)
 
     protected def newDispatcher(
       transport: Transport[In, Out],
       service: Service[Array[Byte], Array[Byte]]
-    ) =
-      new SerialServerDispatcher(transport, service)
+    ): Closable = new ThriftSerialServerDispatcher(transport, service)
 
     def withProtocolFactory(protocolFactory: TProtocolFactory): Server =
       configured(param.ProtocolFactory(protocolFactory))
@@ -327,10 +426,22 @@ object Thrift extends Client[ThriftClientRequest, Array[Byte]] with ThriftRichCl
     def withBufferedTransport(): Server =
       configured(param.Framed(false))
 
+    /**
+     * Produce a [[com.twitter.finagle.Thrift.Server]] with the specified max
+     * size of the reusable buffer for thrift responses. If this size
+     * is exceeded, the buffer is not reused and a new buffer is
+     * allocated for the next thrift response.
+     * @param size Max size of the reusable buffer for thrift responses in bytes.
+     */
+    def withMaxReusableBufferSize(size: Int): Server =
+      configured(Server.param.MaxReusableBufferSize(size))
+
     // Java-friendly forwarders
     // See https://issues.scala-lang.org/browse/SI-8905
     override val withAdmissionControl: ServerAdmissionControlParams[Server] =
       new ServerAdmissionControlParams(this)
+    override val withSession: SessionParams[Server] =
+      new SessionParams(this)
     override val withTransport: ServerTransportParams[Server] =
       new ServerTransportParams(this)
 

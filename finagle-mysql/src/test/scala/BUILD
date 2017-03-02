@@ -1,14 +1,15 @@
-junit_tests(name='scala',
+junit_tests(
   dependencies=[
     '3rdparty/jvm/io/netty',
     '3rdparty/jvm/junit',
-    '3rdparty/jvm/mysql:mysql-connector-mxj-gpl',
     '3rdparty/jvm/mysql:mysql-connector-mxj-gpl-db-files',
     '3rdparty/jvm/mysql:mysql-connector-java',
     '3rdparty/jvm/org/mockito:mockito-all',
     '3rdparty/jvm/org/scalatest',
     'finagle/finagle-mysql',
-    'util/util-core',
+    '3rdparty/jvm/com/github/ben-manes/caffeine:caffeine',
+    'finagle/finagle-core/src/main/scala:scala',
+    'util/util-core/src/main/scala:scala',
   ],
   fatal_warnings=True,
   sources=rglobs('*.scala'),

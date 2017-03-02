@@ -7,16 +7,13 @@ We'd love to get patches from you!
 We are not currently publishing snapshots for Finagle's dependencies, which
 means that it may be necessary to publish the `develop` branches of these
 libraries locally in order to work on Finagle's `develop` branch. To do so
-you can run `./bin/travisci` script and pass it an optional
-`TRAVIS_SCALA_VERSION` environment variable. For example, the following command
-locally publishes all the Finagle dependencies built for Scala 2.11.7.
+you can use our build tool, [dodo](https://github.com/twitter/dodo).
 
-```
-TRAVIS_SCALA_VERSION=2.11.7 ./bin/travisci
+``` bash
+curl -s https://raw.githubusercontent.com/twitter/dodo/develop/bin/build | bash -s -- --no-test finagle
 ```
 
-We are planning to begin publishing snapshots soon, which will make these steps
-unnecessary. If you have any questions or run into any problems, please create
+If you have any questions or run into any problems, please create
 an issue here, tweet at us at [@finagle](https://twitter.com/finagle), or email
 the Finaglers mailing list.
 
@@ -57,23 +54,71 @@ Travis CI more useful for development, but for now you don't need to worry if
 it's failing (assuming that you are able to build and test your changes
 locally).
 
+## Compatibility
+
+We try to keep public APIs stable for the obvious reasons. Often,
+compatibility can be kept by adding a forwarding method. Note that we
+avoid adding default arguments because this is not a compatible change
+for our Java users.  However, when the benefits outweigh the costs, we
+are willing to break APIs. The break should be noted in the Breaking
+API Changes section of the [changelog](CHANGES). Note that changes to
+non-public APIs will not be called out in the [changelog](CHANGES).
+
+## Java
+
+While the project is written in Scala, its public APIs should be usable from
+Java. This occasionally works out naturally from the Scala interop, but more
+often than not, if care is not taken Java users will have rough corners
+(e.g. `SomeCompanion$.MODULE$.someMethod()` or a symbolic operator).
+We take a variety of approaches to minimize this.
+
+1. Add a "compilation" unit test, written in Java, that verifies the APIs are
+   usable from Java.
+2. If there is anything gnarly, we add Java adapters either by adding
+   a non-symbolic method name or by adding a class that does forwarding.
+3. Prefer `abstract` classes over `traits` as they are easier for Java
+   developers to extend.
+
 ## Style
 
 We generally follow [Effective Scala][es] and the [Scala Style Guide][ssg]. When
 in doubt, look around the codebase and see how it's done elsewhere.
+
+## Issues
+
+When creating an issue please try to ahere to the following format:
+
+    One line summary of the issue (less than 72 characters)
+
+    ### Expected behavior
+
+    As concisely as possible, describe the expected behavior.
+
+    ### Actual behavior
+
+    As concisely as possible, describe the observed behavior.
+
+    ### Steps to reproduce the behavior
+
+    List all relevant steps to reproduce the observed behavior.
+
+## Pull Requests
 
 Comments should be formatted to a width no greater than 80 columns.
 
 Files should be exempt of trailing spaces.
 
 We adhere to a specific format for commit messages. Please write your commit
-messages along these guidelines:
+messages along these guidelines. Please keep the line width no greater than
+80 columns (You can use `fmt -n -p -w 80` to accomplish this).
+
     One line description of your change (less than 72 characters)
 
     Problem
 
-    Explain here the context, and why you're making that change.
-    What is the problem you're trying to solve?
+    Explain the context and why you're making that change.  What is the
+    problem you're trying to solve? In some cases there is not a problem
+    and this can be thought of being the motivation for your change.
 
     Solution
 
@@ -81,7 +126,9 @@ messages along these guidelines:
 
     Result
 
-    After your change, what will change?
+    What will change as a result of your pull request? Note that sometimes
+    this section is unnecessary because it is self-explanatory based on
+    the solution.
 
 ## Code Review
 
@@ -141,8 +188,8 @@ simplest solution is to create a symbolic link to `sphinx-build2` named
 `sphinx-build` somewhere on your path.
 
 Please note that any additions or changes to the API must be thoroughly
-described in [ScalaDoc][8] comments. We will also happily consider pull
-requests that improve the existing ScalaDocs!
+described in [Scaladoc][8] comments. We will also happily consider pull
+requests that improve the existing Scaladocs!
 
 [0]: https://github.com/twitter/finagle/pull/267
 [1]: https://github.com/twitter/finagle/issues?direction=desc&labels=Starter&sort=created&state=open

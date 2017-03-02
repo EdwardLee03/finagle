@@ -1,12 +1,15 @@
-package com.twitter.finagle.exp.mysql
+package com.twitter.finagle.mysql
 
-import org.junit.runner.RunWith
-import org.scalatest.junit.JUnitRunner
-import org.scalatest.{MustMatchers, FunSuite}
-import org.scalatest.mock.MockitoSugar
-import org.mockito.Mockito._
-import org.mockito.Matchers._
+import com.twitter.finagle.mysql.transport.TransportImpl
+import com.twitter.finagle.Mysql
 import com.twitter.util.Time
+import java.net.SocketAddress
+import org.junit.runner.RunWith
+import org.mockito.Matchers._
+import org.mockito.Mockito._
+import org.scalatest.junit.JUnitRunner
+import org.scalatest.mock.MockitoSugar
+import org.scalatest.{MustMatchers, FunSuite}
 
 /**
  * Tests the functionality of the MySQL client.
@@ -30,5 +33,12 @@ class ClientTest extends FunSuite with MockitoSugar with MustMatchers {
     verify(client, times(2)).query(sqlQuery)
     verify(factory, times(2)).apply()
     verify(factory, times(0)).close(any[Time])
+  }
+
+  test("Client uses Netty3 by default, but can be toggled to netty4") {
+    val params = Mysql.client.params
+    val addr = new SocketAddress { }
+
+    assert(params[TransportImpl].transporter(params)(addr).toString.equals("Netty3Transporter"))
   }
 }

@@ -1,9 +1,10 @@
 package com.twitter.finagle
 
 import com.twitter.conversions.time._
-import com.twitter.finagle.stats.InMemoryStatsReceiver
-import com.twitter.util.{Future, Await}
-import java.net.{UnknownHostException, InetAddress, InetSocketAddress}
+import com.twitter.finagle.stats.{DefaultStatsReceiver, InMemoryStatsReceiver}
+import com.twitter.util._
+import java.net.{InetAddress, UnknownHostException}
+
 import org.junit.runner.RunWith
 import org.scalatest.FunSuite
 import org.scalatest.junit.JUnitRunner
@@ -12,18 +13,26 @@ import org.scalatest.junit.JUnitRunner
 class InetResolverTest extends FunSuite {
   val statsReceiver = new InMemoryStatsReceiver
 
-  val resolver = new InetResolver(statsReceiver, None) {
-    override def resolveHost(host: String): Future[Seq[InetAddress]] = {
-      if (host.equals("localhost")) super.resolveHost(host)
-      else Future.exception(new UnknownHostException())
-    }
+  val dnsResolver = new DnsResolver(statsReceiver, FuturePool.unboundedPool)
+  def resolveHost(host: String): Future[Seq[InetAddress]] = {
+    if (host.isEmpty || host.equals("localhost")) dnsResolver(host)
+    else Future.exception(new UnknownHostException())
+  }
+  val resolver = new InetResolver(resolveHost, statsReceiver, None, FuturePool.unboundedPool)
+
+  test("local address") {
+    val empty = resolver.bind(":9990")
+    assert(empty.sample() == Addr.Bound(Address(9990)))
+
+    val localhost = resolver.bind("localhost:9990")
+    assert(localhost.sample() == Addr.Bound(Address(9990)))
   }
 
   test("host not found") {
     val addr = resolver.bind("no_TLDs_for_old_humans:80")
     val f = addr.changes.filter(_ == Addr.Neg).toFuture
     assert(Await.result(f) == Addr.Neg)
-    assert(statsReceiver.counter("inet", "dns", "failures")() > 0)
+    assert(statsReceiver.counter("failures")() > 0)
   }
 
   test("resolution failure") {
@@ -40,11 +49,11 @@ class InetResolverTest extends FunSuite {
     val f = addr.changes.filter(_ != Addr.Pending).toFuture
     Await.result(f, 10.seconds) match {
       case Addr.Bound(b, meta) if meta.isEmpty =>
-        assert(b.contains(WeightedSocketAddress(new InetSocketAddress("localhost", 80), 1L)))
+        assert(b.contains(Address("localhost", 80)))
       case _ => fail()
     }
-    assert(statsReceiver.counter("inet", "dns", "successes")() > 0)
-    assert(statsReceiver.stat("inet", "dns", "lookup_ms")().size > 0)
+    assert(statsReceiver.counter("successes")() > 0)
+    assert(statsReceiver.stat("lookup_ms")().size > 0)
   }
 
   test("empty host list returns an empty set") {
@@ -61,11 +70,46 @@ class InetResolverTest extends FunSuite {
     val f = addr.changes.filter(_ != Addr.Pending).toFuture
     Await.result(f) match {
       case Addr.Bound(b, meta) if meta.isEmpty =>
-        assert(b.contains(WeightedSocketAddress(new InetSocketAddress("localhost", 80), 1L)))
+        assert(b.contains(Address("localhost", 80)))
       case _ => fail()
     }
-    assert(statsReceiver.counter("inet", "dns", "successes")() > 0)
-    assert(statsReceiver.stat("inet", "dns", "lookup_ms")().size > 0)
+    assert(statsReceiver.counter("successes")() > 0)
+    assert(statsReceiver.stat("lookup_ms")().size > 0)
   }
 
+  test("updates using custom future pool") {
+    class TestPool(latch: CountDownLatch) extends FuturePool {
+      private val delegate = FuturePool.unboundedPool
+      override def apply[T](f: => T): Future[T] = {
+        latch.countDown()
+        delegate(f)
+      }
+    }
+
+    val latch = new CountDownLatch(1) // DnsResolver will use the pool
+    val resolvePool = new TestPool(latch)
+
+    val dnsResolverWithPool = new DnsResolver(DefaultStatsReceiver, resolvePool)
+
+    def resolveLoopback(host: String): Future[Seq[InetAddress]] = {
+      if (host.equals("127.0.0.1")) dnsResolverWithPool(host)
+      else Future.exception(new UnknownHostException())
+    }
+
+    val pollInterval = 100.millis
+    val inetResolverWithPool = new InetResolver(
+      resolveLoopback, DefaultStatsReceiver, Some(pollInterval), resolvePool)
+
+    val maxWaitTimeout = 10.seconds
+    val addr = inetResolverWithPool.bind("127.0.0.1:80")
+    val f = addr.changes.filter(_ != Addr.Pending).toFuture
+    Await.result(f, 10.seconds) match {
+      case Addr.Bound(b, meta) if meta.isEmpty =>
+        assert(b.contains(Address("127.0.0.1", 80)))
+      case _ => fail()
+    }
+
+    // Should be completed immediately
+    assert(latch.await(maxWaitTimeout))
+  }
 }

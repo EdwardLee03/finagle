@@ -1,10 +1,11 @@
 package com.twitter.finagle.client
 
 import com.twitter.finagle._
+import com.twitter.finagle.context
 import com.twitter.finagle.context.Contexts
 import com.twitter.finagle.factory.{
   BindingFactory, RefcountedFactory, StatsFactoryWrapper, TimeoutFactory}
-import com.twitter.finagle.filter.{DtabStatsFilter, ExceptionSourceFilter, MonitorFilter}
+import com.twitter.finagle.filter._
 import com.twitter.finagle.loadbalancer.LoadBalancerFactory
 import com.twitter.finagle.param._
 import com.twitter.finagle.service._
@@ -14,7 +15,9 @@ import com.twitter.finagle.stats.{LoadedHostStatsReceiver, ClientStatsReceiver}
 import com.twitter.finagle.tracing._
 import com.twitter.finagle.transport.Transport
 import com.twitter.finagle.util.Showable
-import com.twitter.util.Future
+import com.twitter.util.{Future, Time}
+import com.twitter.util.registry.GlobalRegistry
+import java.net.SocketAddress
 
 object StackClient {
   /**
@@ -82,7 +85,7 @@ object StackClient {
      * (via CachingPool) is that this applies to *all* connections and `DefaultPool`
      * only expires connections above the low watermark.
      */
-    stk.push(ExpiringService.module)
+    stk.push(ExpiringService.client)
 
     /**
      * `FailFastFactory` accumulates failures per connection, marking the endpoint
@@ -126,6 +129,15 @@ object StackClient {
     stk.push(FailureAccrualFactory.module)
 
     /**
+     * `ExceptionRemoteInfoFactory` fills in remote info (upstream addr/client id,
+     * downstream addr/client id, and trace id) in exceptions. This needs to be near the top
+     * of the stack so that failures anywhere lower in the stack have remote
+     * info added to them, but below the stats, tracing, and monitor filters so these filters
+     * see exceptions with remote info added.
+     */
+    stk.push(ExceptionRemoteInfoFactory.module)
+
+    /**
      * `StatsServiceFactory` exports a gauge which reports the status of the stack
      * beneath it. It must be above `FailureAccrualFactory` in order to record
      * failure accrual's aggregate view of health over multiple requests.
@@ -156,7 +168,7 @@ object StackClient {
      * client sessions. There is no specific position constraint but higher in the
      * stack is preferable so it can wrap more application logic.
      */
-    stk.push(MonitorFilter.module)
+    stk.push(MonitorFilter.clientModule)
 
     /**
      * `ExceptionSourceFilter` is the exception handler of last resort. It recovers
@@ -175,6 +187,8 @@ object StackClient {
      * It is only evaluated at stack creation time.
      */
     stk.push(LatencyCompensation.module)
+
+
     stk.result
   }
 
@@ -245,6 +259,13 @@ object StackClient {
      *    appear below `FactoryToService` so that services are not
      *    prematurely closed by `FactoryToService`.
      *
+     *  * `NackAdmissionFilter` probabilistically drops requests if the client
+     *    is receiving a large fraction of nack responses. This indicates an
+     *    overload situation. Since this filter should operate on all requests
+     *    sent over the wire including retries, it must be below `Retries`.
+     *    Since it aggregates the status of the entire cluster, it must be above
+     *    `LoadBalancerFactory` (not part of the endpoint stack).
+     *
      *  * `FactoryToService` acquires a new endpoint service from the
      *    load balancer on each request (and closes it after the
      *    response completes).
@@ -252,6 +273,15 @@ object StackClient {
      *  * `Retries` retries `RetryPolicy.RetryableWriteException`s
      *    automatically. It must appear above `FactoryToService` so
      *    that service acquisition failures are retried.
+     *
+     *  * `ClearContextValueFilter` clears the configured Context key,
+     *    `Retries`, in the request's Context. This module must
+     *    come before `Retries` so that it doesn't clear the `Retries`
+     *    set by this client. `Retries` is only meant to be propagated
+     *    one hop from the client to the server. The client overwrites `Retries`
+     *    in the `RequeueFilter` with its own value; however, if the client
+     *    has removed `Retries` in its configuration, we want `Retries`
+     *    to be cleared so the server doesn't see a value set by another client.
      */
     stk.push(LoadBalancerFactory.module)
     stk.push(StatsFactoryWrapper.module)
@@ -259,8 +289,10 @@ object StackClient {
       new RefcountedFactory(fac))
     stk.push(TimeoutFactory.module)
     stk.push(Role.prepFactory, identity[ServiceFactory[Req, Rep]](_))
+    stk.push(NackAdmissionFilter.module)
     stk.push(FactoryToService.module)
     stk.push(Retries.moduleRequeueable)
+    stk.push(ClearContextValueFilter.module(context.Retries))
 
     /*
      * These modules deal with name resolution and request
@@ -385,12 +417,17 @@ trait StackClient[Req, Rep] extends StackBasedClient[Req, Rep]
   def withParams(ps: Stack.Params): StackClient[Req, Rep]
   def configured[P: Stack.Param](p: P): StackClient[Req, Rep]
   def configured[P](psp: (P, Stack.Param[P])): StackClient[Req, Rep]
+  def configuredParams(params: Stack.Params): StackClient[Req, Rep]
 }
 
 /**
  * The standard template implementation for
  * [[com.twitter.finagle.client.StackClient]].
  *
+ * @see The [[http://twitter.github.io/finagle/guide/Clients.html user guide]]
+ *      for further details on Finagle clients and their configuration.
+  * @see [[StackClient.newStack]] for the default modules used by Finagle
+ *      clients.
  */
 trait StdStackClient[Req, Rep, This <: StdStackClient[Req, Rep, This]]
   extends StackClient[Req, Rep]
@@ -399,7 +436,7 @@ trait StdStackClient[Req, Rep, This <: StdStackClient[Req, Rep, This]]
   with ClientParams[This]
   with WithClientAdmissionControl[This]
   with WithClientTransport[This]
-  with WithSession[This]
+  with WithClientSession[This]
   with WithSessionQualifier[This] { self =>
 
   /**
@@ -416,7 +453,7 @@ trait StdStackClient[Req, Rep, This <: StdStackClient[Req, Rep, This]]
    * Defines a typed [[com.twitter.finagle.client.Transporter]] for this client.
    * Concrete StackClient implementations are expected to specify this.
    */
-  protected def newTransporter(): Transporter[In, Out]
+  protected def newTransporter(addr: SocketAddress): Transporter[In, Out]
 
   /**
    * Defines a dispatcher, a function which reconciles the stream based
@@ -451,6 +488,13 @@ trait StdStackClient[Req, Rep, This <: StdStackClient[Req, Rep, This]]
   override def configured[P](psp: (P, Stack.Param[P])): This = {
     val (p, sp) = psp
     configured(p)(sp)
+  }
+
+  /**
+   * Creates a new StackClient with additional parameters `newParams`.
+   */
+  override def configuredParams(newParams: Stack.Params): This = {
+    withParams(params ++ newParams)
   }
 
   /**
@@ -492,24 +536,44 @@ trait StdStackClient[Req, Rep, This <: StdStackClient[Req, Rep, This]]
       def make(prms: Stack.Params, next: Stack[ServiceFactory[Req, Rep]]) = {
         val Transporter.EndpointAddr(addr) = prms[Transporter.EndpointAddr]
         val factory = addr match {
-          case ServiceFactorySocketAddress(sf: ServiceFactory[Req, Rep]) => sf
-          case _ =>
+          case com.twitter.finagle.exp.Address.ServiceFactory(sf: ServiceFactory[Req, Rep], _) => sf
+          case Address.Failed(e) => new FailingFactory[Req, Rep](e)
+          case Address.Inet(ia, _) =>
             val endpointClient = copy1(params=prms)
-            val transporter = endpointClient.newTransporter()
-            val mkFutureSvc: () => Future[Service[Req, Rep]] =
-              () => transporter(addr).map { trans =>
-                // we do not want to capture and request specific Locals
-                // that would live for the life of the session.
-                Contexts.letClear {
-                  endpointClient.newDispatcher(trans)
+            val transporter = endpointClient.newTransporter(ia)
+            // Export info about the transporter type so that we can query info
+            // about its implementation at runtime. This assumes that the `toString`
+            // of the implementation is sufficiently descriptive.
+            val transporterImplKey = Seq(
+              ClientRegistry.registryName,
+              endpointClient.params[ProtocolLibrary].name,
+              endpointClient.params[Label].label,
+              "Transporter")
+            GlobalRegistry.get.put(transporterImplKey, transporter.toString)
+            new ServiceFactory[Req, Rep] {
+              def apply(conn: ClientConnection): Future[Service[Req, Rep]] =
+                transporter().map { trans =>
+                  // we do not want to capture and request specific Locals
+                  // that would live for the life of the session.
+                  Contexts.letClearAll {
+                    endpointClient.newDispatcher(trans)
+                  }
                 }
-              }
-            ServiceFactory(mkFutureSvc)
+
+              def close(deadline: Time): Future[Unit] = transporter.close(deadline)
+            }
         }
         Stack.Leaf(this, factory)
       }
     }
 
+  /**
+   * @inheritdoc
+   *
+   * @param label0 if an empty String is provided, then the label
+   *               from the [[Label]] [[Stack.Params]] is used.
+   *               If that is also an empty String, then `dest` is used.
+   */
   def newClient(dest: Name, label0: String): ServiceFactory[Req, Rep] = {
     val Stats(stats) = params[Stats]
     val Label(label1) = params[Label]
@@ -517,9 +581,9 @@ trait StdStackClient[Req, Rep, This <: StdStackClient[Req, Rep, This]]
     // For historical reasons, we have two sources for identifying
     // a client. The most recently set `label0` takes precedence.
     val clientLabel = (label0, label1) match {
-      case ("", "") => Showable.show(dest)
-      case ("", l1) => l1
-      case (l0, l1) => l0
+      case (Label.Default, Label.Default) => Showable.show(dest)
+      case (Label.Default, l1) => l1
+      case _ => label0
     }
 
     val clientStack = stack ++ (endpointer +: nilStack)

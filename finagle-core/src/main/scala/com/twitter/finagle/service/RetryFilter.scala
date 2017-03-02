@@ -1,7 +1,7 @@
 package com.twitter.finagle.service
 
 import com.twitter.conversions.time._
-import com.twitter.finagle.{Filter, Service}
+import com.twitter.finagle.{FailureFlags, Filter, Service}
 import com.twitter.finagle.Filter.TypeAgnostic
 import com.twitter.finagle.param.HighResTimer
 import com.twitter.finagle.stats.{StatsReceiver, NullStatsReceiver}
@@ -32,6 +32,9 @@ object RetryingService {
  *
  * @note consider using a [[Timer]] with high resolution so that there is
  * less correlation between retries. For example [[HighResTimer.Default]].
+ *
+ * @see The [[https://twitter.github.io/finagle/guide/Servers.html#request-timeout user guide]]
+ *      for more details.
  */
 class RetryFilter[Req, Rep](
     retryPolicy: RetryPolicy[(Req, Try[Rep])],
@@ -59,6 +62,12 @@ class RetryFilter[Req, Rep](
     statsReceiver,
     RetryBudget()
   )
+
+  // Respect non-retryablity regardless of which filter is used
+  private[this] val filteredPolicy: RetryPolicy[(Req, Try[Rep])] = retryPolicy.filterEach {
+    case (_, Throw(f: FailureFlags[_])) if f.isFlagged(FailureFlags.NonRetryable) => false
+    case _ => true
+  }
 
   private[this] val retriesStat = statsReceiver.stat("retries")
 
@@ -94,7 +103,7 @@ class RetryFilter[Req, Rep](
           } else {
             budgetExhausted.incr()
             retriesStat.add(count)
-            svcRep
+            svcRep.transform(FailureFlags.asNonRetryable)
           }
         case None =>
           retriesStat.add(count)
@@ -105,7 +114,7 @@ class RetryFilter[Req, Rep](
 
   def apply(request: Req, service: Service[Req, Rep]): Future[Rep] = {
     retryBudget.deposit()
-    dispatch(request, service, retryPolicy)
+    dispatch(request, service, filteredPolicy)
   }
 }
 

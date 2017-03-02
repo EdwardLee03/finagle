@@ -3,11 +3,10 @@ package com.twitter.finagle.http.javaapi;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 
-import org.jboss.netty.buffer.ChannelBuffers;
-
 import com.twitter.finagle.Server;
 import com.twitter.finagle.Service;
 import com.twitter.finagle.builder.ServerBuilder;
+import com.twitter.finagle.client.StackClient$;
 import com.twitter.finagle.http.Http;
 import com.twitter.finagle.http.Request;
 import com.twitter.finagle.http.Response;
@@ -24,7 +23,7 @@ public final class HttpServerTest {
         public Future<Response> apply(Request request) {
           Response response = Response.apply();
           // Respond right away.
-          response.setContent(ChannelBuffers.wrappedBuffer("yo".getBytes()));
+          response.setContentString("yo");
 
           Future<Response> future = Future.value(response);
           return future;
@@ -52,6 +51,7 @@ public final class HttpServerTest {
             .server()
             .withCompressionLevel(2)
             .configured(new Label("test").mk())
-            .withDecompression(true);
+            .withDecompression(true)
+            .configuredParams(StackClient$.MODULE$.defaultParams());
   }
 }

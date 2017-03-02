@@ -1,9 +1,11 @@
 package com.twitter.finagle.integration
 
+import com.twitter.conversions.time._
 import com.twitter.finagle._
 import com.twitter.finagle.builder.{ClientBuilder, ServerBuilder}
 import com.twitter.finagle.client.{StackClient, StringClient}
 import com.twitter.finagle.server.StringServer
+import com.twitter.finagle.service.FailureAccrualFactory
 import com.twitter.util.{Await, Future}
 import java.net.{InetAddress, InetSocketAddress}
 import org.junit.runner.RunWith
@@ -27,7 +29,9 @@ class StackTest extends FunSuite {
       val server = stringServer.serve(new InetSocketAddress(0), failService)
       val client =
         stringClient.withStack(newClientStack)
-          .newService(Name.bound(server.boundAddress), "client")
+          .configured(FailureAccrualFactory.Param(5, 1.minute))
+          .newService(Name.bound(Address(
+            server.boundAddress.asInstanceOf[InetSocketAddress])), "client")
 
       // marked busy by FailureAccrualFactory
       for (_ <- 0 until 6) {
@@ -48,7 +52,8 @@ class StackTest extends FunSuite {
 
       val client = ClientBuilder()
         .codec(StringCodec)
-        .hosts(Seq(server.boundAddress))
+        .failureAccrualParams((5, 1.minute))
+        .hosts(Seq(server.boundAddress.asInstanceOf[InetSocketAddress]))
         .hostConnectionLimit(1)
         .build()
 
@@ -65,7 +70,8 @@ class StackTest extends FunSuite {
     new TestCtx {
       val client =
         stringClient.withStack(newClientStack)
-          .newService(Name.bound(new InetSocketAddress(InetAddress.getLoopbackAddress, 0)), "client")
+          .newService(Name.bound(Address(new InetSocketAddress(
+            InetAddress.getLoopbackAddress, 0))), "client")
 
       // marked busy by FailFastFactory
       intercept[Exception](Await.result(client("hello\n")))

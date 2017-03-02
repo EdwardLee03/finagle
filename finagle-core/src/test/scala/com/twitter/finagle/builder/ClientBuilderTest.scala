@@ -1,22 +1,23 @@
 package com.twitter.finagle.builder
 
+import com.twitter.conversions.time._
 import com.twitter.finagle._
+import com.twitter.finagle.client.StringClient
 import com.twitter.finagle.integration.IntegrationBase
 import com.twitter.finagle.param.ProtocolLibrary
-import com.twitter.finagle.stats.NullStatsReceiver
-import com.twitter.finagle.service.{RetryPolicy, FailureAccrualFactory}
-import com.twitter.finagle.stats.InMemoryStatsReceiver
+import com.twitter.finagle.service.RetryPolicy
+import com.twitter.finagle.stats.{InMemoryStatsReceiver, NullStatsReceiver}
 import com.twitter.util._
 import com.twitter.util.registry.{GlobalRegistry, SimpleRegistry}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicBoolean}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import org.junit.runner.RunWith
-import org.mockito.Mockito.{verify, when}
 import org.mockito.Matchers
 import org.mockito.Matchers._
+import org.mockito.Mockito.{verify, when}
 import org.scalatest.FunSuite
-import org.scalatest.mock.MockitoSugar
-import org.scalatest.junit.JUnitRunner
 import org.scalatest.concurrent.{Eventually, IntegrationPatience}
+import org.scalatest.junit.JUnitRunner
+import org.scalatest.mockito.MockitoSugar
 
 @RunWith(classOf[JUnitRunner])
 class ClientBuilderTest extends FunSuite
@@ -35,7 +36,8 @@ class ClientBuilderTest extends FunSuite
       preparedFactory.asInstanceOf[ServiceFactory[Any, Nothing]]
 
     val m = new MockChannel
-    when(m.codec.prepareConnFactory(any[ServiceFactory[String, String]])) thenReturn preparedFactory
+    when(m.codec.prepareConnFactory(any[ServiceFactory[String, String]], any[Stack.Params]))
+      .thenReturn(preparedFactory)
   }
 
   test("ClientBuilder should invoke prepareConnFactory on connection") {
@@ -43,7 +45,7 @@ class ClientBuilderTest extends FunSuite
       val client = m.build()
       val requestFuture = client("123")
 
-      verify(m.codec).prepareConnFactory(any[ServiceFactory[String, String]])
+      verify(m.codec).prepareConnFactory(any[ServiceFactory[String, String]], any[Stack.Params])
       verify(preparedFactory)()
 
       assert(!requestFuture.isDefined)
@@ -116,6 +118,26 @@ class ClientBuilderTest extends FunSuite
       .build()
   }
 
+  verifyProtocolRegistry("#codec(CodecFactory#Client) along with #stack", expected = "fancy") {
+    val ctx = new ClientBuilderHelper {}
+    when(ctx.m.codec.protocolLibraryName).thenReturn("fancy")
+
+    val cfClient: CodecFactory[String, String]#Client =
+      { (_: ClientCodecConfig) => ctx.m.codec }
+
+    val stringClient = new StringClient {}
+
+    ClientBuilder()
+      .name("test")
+      .hostConnectionLimit(1)
+      // make sure that we replace the string client's Stack's
+      // protocol library with the codec's because we call codec afterwards.
+      .stack(stringClient.stringClient)
+      .codec(cfClient)
+      .hosts("")
+      .build()
+  }
+
   verifyProtocolRegistry("configured protocol", expected = "extra fancy") {
     val ctx = new ClientBuilderHelper {}
     when(ctx.m.codec.protocolLibraryName).thenReturn("fancy")
@@ -180,17 +202,18 @@ class ClientBuilderTest extends FunSuite
 
   test("ClientBuilder should collect stats on 'tries' with no retrypolicy") {
     new ClientBuilderHelper {
+      val numFailures = 5
       val inMemory = new InMemoryStatsReceiver
       val builder = ClientBuilder()
         .name("test")
         .hostConnectionLimit(1)
+        .failureAccrualParams((numFailures, 1.minute))
         .codec(m.codec)
         .daemon(true) // don't create an exit guard
         .hosts(Seq(m.clientAddress))
         .reportTo(inMemory)
 
       val client = builder.build()
-      val numFailures = 5
 
       val service = mock[Service[String, String]]
       when(service("123")) thenReturn Future.exception(WriteException(new Exception()))
@@ -307,4 +330,13 @@ class ClientBuilderTest extends FunSuite
       assert(999 == localOnRetry.get)
     }
   }
+
+  test("configured") {
+    val cb = ClientBuilder()
+    assert(!cb.params.contains[ProtocolLibrary])
+    val configured = cb.configured(ProtocolLibrary("derp"))
+    assert(configured.params.contains[ProtocolLibrary])
+    assert("derp" == configured.params[ProtocolLibrary].name)
+  }
+
 }

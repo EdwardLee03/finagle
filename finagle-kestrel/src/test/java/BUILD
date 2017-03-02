@@ -1,11 +1,11 @@
-junit_tests(name='java',
+junit_tests(
   dependencies=[
     '3rdparty/jvm/org/scala-lang:scala-library',
     '3rdparty/jvm/junit',
-    'finagle/finagle-core',
-    'finagle/finagle-kestrel',
-    'util/util-core'
+    'util/util-core',
+    'finagle/finagle-core/src/main/scala:scala',
+    'finagle/finagle-kestrel/src/main/scala:scala',
   ],
-  fatal_warnings=False,
+  fatal_warnings=True,
   sources=rglobs('*.java')
 )

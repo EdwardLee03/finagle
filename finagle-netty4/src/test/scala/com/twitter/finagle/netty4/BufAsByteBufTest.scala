@@ -4,7 +4,7 @@ import com.twitter.io.Buf
 import io.netty.buffer.{ByteBuf, Unpooled}
 import io.netty.util.CharsetUtil
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
-import java.nio.{ByteBuffer, ByteOrder, ReadOnlyBufferException}
+import java.nio.{ByteBuffer, ReadOnlyBufferException}
 import java.util._
 import org.junit.Assert._
 import org.junit.runner.RunWith
@@ -185,7 +185,7 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
 
   test("getByteArray boundary check 3") {
     val dst = new Array[Byte](4)
-    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray(1,2,3,4))
+    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(Array[Byte](1,2,3,4)))
     intercept[IndexOutOfBoundsException] {
       wrappedBuf.getBytes(0, dst, -1, 4)
     }
@@ -199,7 +199,7 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
 
   test("getByteArray boundary check 4") {
     val dst = new Array[Byte](4)
-    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray(1,2,3,4))
+    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(Array[Byte](1,2,3,4)))
     intercept[IndexOutOfBoundsException] {
       wrappedBuf.getBytes(0, dst, 1, 4)
     }
@@ -264,7 +264,7 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     dst.position(1)
     dst.limit(3)
 
-    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray(1,2,3,4))
+    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(Array[Byte](1,2,3,4)))
     wrappedBuf.getBytes(1, dst)
 
     assert(3 == dst.position())
@@ -288,7 +288,7 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     dst.position(1)
     dst.limit(3)
 
-    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray(1,2,3,4))
+    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(Array[Byte](1,2,3,4)))
     wrappedBuf.getBytes(1, dst)
 
     assert(3 == dst.position())
@@ -1249,7 +1249,6 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     assertEquals(0, copy.readerIndex)
     assertEquals(wrappedBuf.readableBytes, copy.writerIndex())
     assertEquals(wrappedBuf.readableBytes, copy.capacity)
-    assertSame(wrappedBuf.order(), copy.order())
     0.until(copy.capacity).foreach { i =>
       assertEquals(wrappedBuf.getByte(i + readerIndex), copy.getByte(i))
     }
@@ -1269,7 +1268,6 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     assertEquals(wrappedBuf.readerIndex, duplicate.readerIndex)
     assertEquals(wrappedBuf.writerIndex(), duplicate.writerIndex())
     assertEquals(wrappedBuf.capacity, duplicate.capacity)
-    assertSame(wrappedBuf.order(), duplicate.order())
     0.until(duplicate.capacity).foreach { i =>
       assertEquals(wrappedBuf.getByte(i), duplicate.getByte(i))
     }
@@ -1278,13 +1276,6 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     intercept[ReadOnlyBufferException] {
       duplicate.setByte(1, 1)
     }
-  }
-
-  test("slice endianness") {
-    assertEquals(buffer.order(), buffer.slice(0, buffer.capacity).order())
-    assertEquals(buffer.order(), buffer.slice(0, buffer.capacity - 1).order())
-    assertEquals(buffer.order(), buffer.slice(1, buffer.capacity - 1).order())
-    assertEquals(buffer.order(), buffer.slice(1, buffer.capacity - 2).order())
   }
 
   test("slice index") {
@@ -1309,12 +1300,11 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(bytes))
     wrappedBuf.setIndex(0, value.length)
 
-    assertEquals(wrappedBuf, Unpooled.wrappedBuffer(value).order(ByteOrder.BIG_ENDIAN))
-    assertEquals(wrappedBuf, Unpooled.wrappedBuffer(value).order(ByteOrder.LITTLE_ENDIAN))
+
+    assertEquals(wrappedBuf, Unpooled.wrappedBuffer(value))
 
     value(0) = (value(0) + 1).asInstanceOf[Byte]
-    assert(!wrappedBuf.equals(Unpooled.wrappedBuffer(value).order(ByteOrder.BIG_ENDIAN)))
-    assert(!wrappedBuf.equals(Unpooled.wrappedBuffer(value).order(ByteOrder.LITTLE_ENDIAN)))
+    assert(!wrappedBuf.equals(Unpooled.wrappedBuffer(value)))
   }
 
   test("compareTo") {
@@ -1336,21 +1326,16 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(bytes))
     wrappedBuf.setIndex(0, value.length)
 
-    assertEquals(0, wrappedBuf.compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.BIG_ENDIAN)))
-    assertEquals(0, wrappedBuf.compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.LITTLE_ENDIAN)))
+    assertEquals(0, wrappedBuf.compareTo(Unpooled.wrappedBuffer(value)))
 
     value(0) = (value(0) + 1).asInstanceOf[Byte]
-    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.BIG_ENDIAN)) < 0)
-    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.LITTLE_ENDIAN)) < 0)
+    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value)) < 0)
     value(0) = (value(0) - 2).asInstanceOf[Byte]
-    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.BIG_ENDIAN)) > 0)
-    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.LITTLE_ENDIAN)) > 0)
+    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value)) > 0)
     value(0) = (value(0) + 1).asInstanceOf[Byte]
 
-    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value, 0, 31).order(ByteOrder.BIG_ENDIAN)) > 0)
-    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value, 0, 31).order(ByteOrder.LITTLE_ENDIAN)) > 0)
-    assert(wrappedBuf.slice(0, 31).compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.BIG_ENDIAN)) < 0)
-    assert(wrappedBuf.slice(0, 31).compareTo(Unpooled.wrappedBuffer(value).order(ByteOrder.LITTLE_ENDIAN)) < 0)
+    assert(wrappedBuf.compareTo(Unpooled.wrappedBuffer(value, 0, 31)) > 0)
+    assert(wrappedBuf.slice(0, 31).compareTo(Unpooled.wrappedBuffer(value)) < 0)
   }
 
   test("toString") {
@@ -1360,7 +1345,7 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
   }
 
   test("indexOf") {
-    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray(1,2,3,2,1))
+    val wrappedBuf = BufAsByteBuf.Owned(Buf.ByteArray.Owned(Array[Byte](1,2,3,2,1)))
 
     assertEquals(-1, wrappedBuf.indexOf(1, 4, 1: Byte))
     assertEquals(-1, wrappedBuf.indexOf(4, 1, 1: Byte))
@@ -1382,10 +1367,6 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
     0.until(Capacity - BlockSize + 1, BlockSize).foreach { i =>
       assertEquals(ByteBuffer.wrap(value, i, BlockSize), wrappedBuf.nioBuffer(i, BlockSize))
     }
-  }
-
-  test("nioBuffer") {
-    assertEquals(buffer.order(), buffer.nioBuffer().order())
   }
 
   test("nioBuffers 1") {
@@ -1491,6 +1472,11 @@ class BufAsByteBufTest extends FunSuite with BeforeAndAfter {
   testConstructAndExtract(
     "Buf.ByteArray",
     Buf.ByteArray.Owned(Array[Byte](0, 1, 2, 3, 4))
+  )
+
+  testConstructAndExtract(
+    "Buf.ByteArray with begin and end",
+    Buf.ByteArray.Owned(Array[Byte](0, 1, 2, 3, 4), 3, 4)
   )
 
   testConstructAndExtract(
